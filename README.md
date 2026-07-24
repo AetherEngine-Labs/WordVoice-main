@@ -17,6 +17,14 @@
 ---
 
 <div align="center">
+---
+
+# 📢 Updates
+
+- **2026/07/08**: 🚀 We officially released the **WordVoice** implementation, the **WordVoice-5A** dataset, and the **WordVoice-5A Pipeline**, making the complete training pipeline publicly available.
+- **2026/07/08**: 📄 The WordVoice [paper](https://arxiv.org/abs/2607.06461) is now available on **arXiv**.
+
+---
 
 # 🌏 Language
 
