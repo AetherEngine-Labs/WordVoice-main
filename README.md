@@ -12,18 +12,18 @@
 ![WordVoice Logo](./pic/wordvoice.png)
 **WordVoice 官方模型实现：基于 CosyVoice3 框架的字级别显式与解耦多维控制 TTS**
 
-
+<br>
 </div>
 
----
-
-> ## 📢 Updates
+> ## 📢 更新
 >
 > **2026/07/08**
-> - 🎉 **WordVoice** is now publicly available! The [paper](https://arxiv.org/abs/2607.06461) is available on **arXiv**.
-> - 🚀 Released the official **WordVoice** implementation, the **WordVoice-5A** dataset, and the **WordVoice-5A Pipeline**.
+> - 🎉 **WordVoice** 正式开源！[论文](https://arxiv.org/abs/2607.06461)已发布至 **arXiv**。
+> - 🚀 正式发布 **WordVoice** 模型实现、**WordVoice-5A** 数据集及对应的 **WordVoice-5A Pipeline**，完整开放训练与数据处理流程。
 
 
+
+<br>
 <div align="center">
 
 # 🌏 Language
