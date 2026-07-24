@@ -14,13 +14,17 @@
 
 
 </div>
+
 ---
+
 > ## 📢 Updates
 >
 > **2026/07/08**
 > - 🎉 **WordVoice** is now publicly available! The [paper](https://arxiv.org/abs/2607.06461) is available on **arXiv**.
 > - 🚀 Released the official **WordVoice** implementation, the **WordVoice-5A** dataset, and the **WordVoice-5A Pipeline**.
+
 ---
+
 <div align="center">
 
 # 🌏 Language
