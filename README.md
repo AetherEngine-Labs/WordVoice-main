@@ -19,7 +19,7 @@
 > ## 📢 更新
 >
 > **2026/07/29**
-> - 🤗 感谢 **Hugging Face** 团队为 WordVoice 构建交互式在线 Demo，并将其转让至我们的账号。欢迎在 [Hugging Face Spaces](https://huggingface.co/spaces/XXH333/wordvoice-tts) 在线体验 **WordVoice TTS**。
+> - 🤗 感谢 **Hugging Face** 团队为 WordVoice 构建交互式在线 Demo，欢迎在 [Hugging Face Spaces](https://huggingface.co/spaces/XXH333/wordvoice-tts) 在线体验 **WordVoice TTS**。
 >
 > **2026/07/08**
 > - 🎉 **WordVoice** 正式开源！[论文](https://arxiv.org/abs/2607.06461)已发布至 **arXiv**。
