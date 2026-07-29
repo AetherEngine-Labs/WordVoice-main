@@ -7,6 +7,7 @@
 [![Pipeline](https://img.shields.io/badge/Pipeline-WordVoice--5A-blue.svg)](https://github.com/XXH333/WordVoice-5A-Pipeline)
 [![Dataset](https://img.shields.io/badge/Dataset-WordVoice--5A-green.svg)](https://huggingface.co/datasets/XXH333/WordVoice-5A)
 [![Model](https://img.shields.io/badge/Model-WordVoice-red.svg)](https://huggingface.co/XXH333/WordVoice-base-0.5B)
+[![Hugging Face Space](https://img.shields.io/badge/🤗%20Hugging%20Face-Space-ffcc4d.svg)](https://huggingface.co/spaces/XXH333/wordvoice-tts)
 [![Python](https://img.shields.io/badge/Python-3.10-blue.svg)](https://www.python.org/)
 
 ![WordVoice Logo](./pic/wordvoice.png)
