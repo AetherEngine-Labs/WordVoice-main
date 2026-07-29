@@ -11,7 +11,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10-blue.svg)](https://www.python.org/)
 
 ![WordVoice Logo](./pic/wordvoice.png)
-**WordVoice 官方模型实现：基于 CosyVoice3 框架的字级别显式与解耦多维控制 TTS**
+**Official WordVoice Implementation: Explicit and Decoupled Multi-Dimensional Word-Level Control TTS Built on CosyVoice3**
 
 <br>
 </div>
