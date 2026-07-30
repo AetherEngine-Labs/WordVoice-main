@@ -19,11 +19,11 @@
 > ## 📢 更新
 >
 > **2026/07/29**
-> - 🤗 感谢 **Hugging Face** 团队为 WordVoice 构建交互式在线 Demo，欢迎在 [Hugging Face Spaces](https://huggingface.co/spaces/XXH333/wordvoice-tts) 在线体验 **WordVoice TTS**。
+> - 🤗 We sincerely thank the Hugging Face team for building an interactive online demo for WordVoice. Try **WordVoice TTS** online now on [Hugging Face Spaces](https://huggingface.co/spaces/XXH333/wordvoice-tts).
 >
 > **2026/07/08**
-> - 🎉 **WordVoice** 正式开源！[论文](https://arxiv.org/abs/2607.06461)已发布至 **arXiv**。
-> - 🚀 正式发布 **WordVoice** 模型实现、**WordVoice-5A** 数据集及对应的 **WordVoice-5A Pipeline**，完整开放训练与数据处理流程。
+> - 🎉 **WordVoice** is officially open-sourced! The [paper](https://arxiv.org/abs/2607.06461) is now available on **arXiv**.
+> - 🚀 We have officially released the **WordVoice** model implementation, the **WordVoice-5A** dataset, and the corresponding **WordVoice-5A Pipeline**, fully open-sourcing the training and data-processing workflow.
 
 
 
