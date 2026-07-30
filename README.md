@@ -16,7 +16,7 @@
 <br>
 </div>
 
-> ## 📢 更新
+> ## 📢 Updates
 >
 > **2026/07/29**
 > - 🤗 We sincerely thank the Hugging Face team for building an interactive online demo for WordVoice. Try **WordVoice TTS** online now on [Hugging Face Spaces](https://huggingface.co/spaces/XXH333/wordvoice-tts).
