@@ -227,6 +227,19 @@ class Qwen2Encoder(torch.nn.Module):
     def __init__(self, pretrain_path):
         super().__init__()
         self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
+        self.native_decoder = None
+
+    def enable_wordvoice_tensorrt(self, runtime_dir, checkpoint_path):
+        from cosyvoice.llm.wordvoice_trt import WordVoiceTensorRTDecoder
+
+        candidate = WordVoiceTensorRTDecoder(runtime_dir, checkpoint_path)
+        candidate.validate_against_eager(self.model)
+        self.native_decoder = candidate
+
+    def consume_native_metrics(self):
+        if self.native_decoder is None:
+            return None
+        return self.native_decoder.consume_metrics()
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
         T = xs.size(1)
@@ -240,6 +253,8 @@ class Qwen2Encoder(torch.nn.Module):
         return outs.hidden_states[-1], masks.unsqueeze(1)
 
     def forward_one_step(self, xs, masks, cache=None):
+        if cache is not None and self.native_decoder is not None:
+            return self.native_decoder.forward_one_step(xs, masks, cache)
         input_masks = masks[:, -1, :]
         outs = self.model(
             inputs_embeds=xs,

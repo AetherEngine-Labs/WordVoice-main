@@ -187,7 +187,7 @@ class CosyVoice2(CosyVoice):
 
 
 class WordVoice(CosyVoice2):
-    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1):
+    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, llm_trt_runtime=None):
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
@@ -206,6 +206,8 @@ class WordVoice(CosyVoice2):
                                           '{}/spk2info.pt'.format(model_dir),
                                           configs['allowed_special'])
         self.sample_rate = configs['sample_rate']
+        if torch.cuda.is_available() is False and llm_trt_runtime is not None:
+            raise RuntimeError('WordVoice TensorRT decoder requires CUDA')
         if torch.cuda.is_available() is False and (load_trt is True or fp16 is True):
             load_trt, fp16 = False, False
             logging.warning('no cuda device, set load_trt/fp16 to False')
@@ -217,6 +219,8 @@ class WordVoice(CosyVoice2):
         self.model.load(llm_path,
                         flow_path,
                         '{}/hift.pt'.format(model_dir))
+        if llm_trt_runtime is not None:
+            self.model.llm.llm.enable_wordvoice_tensorrt(llm_trt_runtime, llm_path)
         if load_vllm:
             self.model.load_vllm('{}/vllm'.format(model_dir))
         if load_trt:

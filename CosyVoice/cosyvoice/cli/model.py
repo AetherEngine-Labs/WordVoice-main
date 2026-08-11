@@ -529,6 +529,7 @@ class CosyVoice3Model(CosyVoice2Model):
         llm_started = time.perf_counter()
         dur_list, bnd_list, tone_list, f0_list, eng_list, pau_list = self.wordvoice_llm_job(text, prompt_text, llm_prompt_speech_token, llm_embedding, word_list, start_list, dur_list, bnd_list, tone_list, eng_list, f0_list, this_uuid)
         llm_seconds = time.perf_counter() - llm_started
+        native_runtime_metrics = self.llm.llm.consume_native_metrics()
 
         prompt_words_len = len(start_list)
         bnd_control = bnd_list[prompt_words_len:]
@@ -554,16 +555,19 @@ class CosyVoice3Model(CosyVoice2Model):
                                             speed=speed)
         this_tts_speech = this_tts_speech.cpu()
         flow_seconds = time.perf_counter() - flow_started
+        runtime_metrics = {
+            'llm_seconds': round(llm_seconds, 3),
+            'flow_vocoder_seconds': round(flow_seconds, 3),
+        }
+        if native_runtime_metrics is not None:
+            runtime_metrics.update(native_runtime_metrics)
         yield {'tts_speech': this_tts_speech,
                'dur_list': dur_control, 
                'bnd_list': bnd_control, 
                'tone_list': tone_control, 
                'f0_list': f0_control, 
                'eng_list': eng_control,
-               'runtime_metrics': {
-                   'llm_seconds': round(llm_seconds, 3),
-                   'flow_vocoder_seconds': round(flow_seconds, 3),
-               }}
+               'runtime_metrics': runtime_metrics}
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
             self.tts_word_token_dict.pop(this_uuid)
