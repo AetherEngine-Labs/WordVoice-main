@@ -163,6 +163,7 @@ def build_engine(
     num_kv_heads: int,
     head_dim: int,
     hidden_size: int,
+    opt_past_tokens: int,
     max_past_tokens: int,
     precision: str,
 ) -> None:
@@ -195,7 +196,7 @@ def build_engine(
             profile.set_shape(
                 cache_tensor_name(kind, layer),
                 (1, num_kv_heads, 1, head_dim),
-                (1, num_kv_heads, 256, head_dim),
+                (1, num_kv_heads, opt_past_tokens, head_dim),
                 (1, num_kv_heads, max_past_tokens, head_dim),
             )
     config.add_optimization_profile(profile)
@@ -213,6 +214,7 @@ def main() -> int:
     parser.add_argument("--base-model-dir", type=Path, required=True)
     parser.add_argument("--wordvoice-llm", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--opt-past-tokens", type=int, default=256)
     parser.add_argument("--max-past-tokens", type=int, default=2048)
     parser.add_argument(
         "--precision", choices=("fp32", "autocast_fp16"), required=True
@@ -234,6 +236,10 @@ def main() -> int:
         raise RuntimeError("WordVoice TensorRT build requires CUDA")
     if args.max_past_tokens < 512:
         raise RuntimeError("--max-past-tokens must be at least 512")
+    if not 1 <= args.opt_past_tokens <= args.max_past_tokens:
+        raise RuntimeError(
+            "--opt-past-tokens must be between 1 and --max-past-tokens"
+        )
     for required in (args.base_model_dir, args.wordvoice_llm):
         if not required.exists():
             raise RuntimeError(f"WordVoice TensorRT build input is missing: {required}")
@@ -346,6 +352,7 @@ def main() -> int:
             num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
             hidden_size=config.hidden_size,
+            opt_past_tokens=args.opt_past_tokens,
             max_past_tokens=args.max_past_tokens,
             precision=args.precision,
         )
@@ -369,6 +376,7 @@ def main() -> int:
             "num_key_value_heads": config.num_key_value_heads,
             "head_dim": head_dim,
             "hidden_size": config.hidden_size,
+            "opt_past_tokens": args.opt_past_tokens,
             "max_past_tokens": args.max_past_tokens,
             "base_model_config_sha256": sha256(args.base_model_dir / "config.json"),
             "wordvoice_llm_sha256": sha256(args.wordvoice_llm),
