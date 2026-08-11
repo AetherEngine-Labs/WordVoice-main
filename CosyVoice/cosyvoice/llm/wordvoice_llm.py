@@ -670,7 +670,7 @@ class Qwen2LM(TransformerLM):
                     logits[:, silent_masks] = -float('inf')
 
             # 采样
-            token_id = self.sampling_ids(logits.log_softmax(dim=-1).squeeze(dim=0), generate_speech_token, sampling, ignore_eos=True if step < min_len else False)
+            token_id = self.sampling_ids(logits.squeeze(dim=0), generate_speech_token, sampling, ignore_eos=True if step < min_len else False)
             if token_id in self.silent_tokens:
                 pau_list[word_idx-1] += 1
 

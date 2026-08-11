@@ -32,6 +32,16 @@ def reference_nucleus_sampling(weighted_scores, top_p=0.8, top_k=25):
 
 
 class NucleusSamplingTest(unittest.TestCase):
+    def test_raw_logits_preserve_seeded_log_probability_selection(self):
+        generator = torch.Generator().manual_seed(20260811)
+        for scale in (0.1, 1.0, 4.0, 20.0):
+            for seed in range(25):
+                logits = torch.randn(6563, generator=generator) * scale
+                torch.manual_seed(seed)
+                expected = nucleus_sampling(logits.log_softmax(dim=0))
+                torch.manual_seed(seed)
+                self.assertEqual(nucleus_sampling(logits), expected)
+
     def test_matches_original_seeded_selection(self):
         generator = torch.Generator().manual_seed(37)
         for seed in range(50):
