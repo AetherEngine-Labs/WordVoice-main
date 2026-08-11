@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Generator
+from typing import Any, Generator, cast
 import torch
 import numpy as np
 import threading
@@ -419,8 +419,90 @@ class CosyVoice3Model(CosyVoice2Model):
         self.tts_word_token_dict = {}
         self.llm_end_dict = {}
         self.hift_cache_dict = {}
+        self.flow_runtime_metrics = {'flow_backend': 'eager'}
+        self.flow_amp_dtype = None
         # FSQ silent and breath token
         self.silent_tokens = [1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323]
+
+    def enable_wordvoice_flow_amp(self, dtype):
+        if dtype != 'bf16':
+            raise ValueError('WordVoice flow AMP supports only bf16')
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            raise RuntimeError('WordVoice bf16 flow AMP requires a CUDA bf16-capable GPU')
+        parity = self._validate_wordvoice_flow_bf16()
+        self.flow_amp_dtype = torch.bfloat16
+        self.flow_runtime_metrics = {
+            'flow_backend': 'pytorch_amp',
+            'flow_precision': 'bf16',
+            'flow_parity': parity,
+        }
+
+    def _validate_wordvoice_flow_bf16(self):
+        estimator = cast(Any, self.flow).decoder.estimator
+        if not isinstance(estimator, torch.nn.Module):
+            raise RuntimeError('WordVoice bf16 flow AMP requires the PyTorch flow estimator')
+        relative_rmse_limit = 0.025
+        cosine_similarity_limit = 0.9998
+        max_relative_rmse = 0.0
+        min_cosine_similarity = 1.0
+        was_training = estimator.training
+        estimator.eval()
+        try:
+            for sequence_length in (64, 256, 1024):
+                generator = torch.Generator(device=self.device).manual_seed(sequence_length)
+                inputs = (
+                    torch.randn(2, 80, sequence_length, device=self.device, generator=generator),
+                    torch.ones(2, 1, sequence_length, device=self.device),
+                    torch.randn(2, 80, sequence_length, device=self.device, generator=generator),
+                    torch.tensor([0.25, 0.25], device=self.device),
+                    torch.randn(2, 80, device=self.device, generator=generator),
+                    torch.randn(2, 80, sequence_length, device=self.device, generator=generator),
+                )
+                with torch.inference_mode():
+                    expected = estimator(*inputs, streaming=False)
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        actual = estimator(*inputs, streaming=False)
+                nonfinite = {
+                    name: int((~torch.isfinite(output)).sum().item())
+                    for name, output in (('expected', expected), ('actual', actual))
+                    if not torch.isfinite(output).all()
+                }
+                if nonfinite:
+                    raise RuntimeError(
+                        'WordVoice bf16 flow AMP gate failed; '
+                        f'stage=parity-nonfinite; sequence_length={sequence_length}; '
+                        f'nonfinite={nonfinite}'
+                    )
+                expected_float = expected.float()
+                difference = actual.float() - expected_float
+                rmse = torch.sqrt(torch.mean(difference.square()))
+                expected_rms = torch.sqrt(torch.mean(expected_float.square()))
+                relative_rmse = float((rmse / expected_rms).item())
+                cosine_similarity = float(
+                    F.cosine_similarity(
+                        actual.float().flatten(), expected_float.flatten(), dim=0
+                    ).item()
+                )
+                max_relative_rmse = max(max_relative_rmse, relative_rmse)
+                min_cosine_similarity = min(min_cosine_similarity, cosine_similarity)
+        finally:
+            estimator.train(was_training)
+        parity = {
+            'sequence_lengths': [64, 256, 1024],
+            'max_relative_rmse': round(max_relative_rmse, 6),
+            'min_cosine_similarity': round(min_cosine_similarity, 8),
+        }
+        if (
+            max_relative_rmse > relative_rmse_limit
+            or min_cosine_similarity < cosine_similarity_limit
+        ):
+            raise RuntimeError(
+                'WordVoice bf16 flow AMP gate failed; stage=parity; '
+                f'limits={{"max_relative_rmse": {relative_rmse_limit}, '
+                f'"min_cosine_similarity": {cosine_similarity_limit}}}; '
+                f'actual={parity}'
+            )
+        return parity
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
@@ -451,21 +533,37 @@ class CosyVoice3Model(CosyVoice2Model):
 
     def wordvoice_token2wav(self, token, start_id, dur_list, bnd_list, tone_list, f0_list, eng_list, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
-            tts_mel, _ = self.flow.inference_wordvoice(token=token.to(self.device, dtype=torch.int32),
-                                             token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
-                                             prompt_token=prompt_token.to(self.device),
-                                             prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
-                                             start_id=start_id,
-                                             dur_list=dur_list,
-                                             bnd_list=bnd_list,
-                                             tone_list=tone_list,
-                                             f0_list=f0_list,
-                                             eng_list=eng_list,
-                                             prompt_feat=prompt_feat.to(self.device),
-                                             prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
-                                             embedding=embedding.to(self.device),
-                                             streaming=stream,
-                                             finalize=finalize)
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            flow_started = time.perf_counter()
+            flow_autocast = torch.cuda.amp.autocast(
+                enabled=self.flow_amp_dtype is not None,
+                dtype=self.flow_amp_dtype or torch.float16,
+            )
+            with flow_autocast:
+                tts_mel, flow_timing_events = self.flow.inference_wordvoice(token=token.to(self.device, dtype=torch.int32),
+                                                 token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                                 prompt_token=prompt_token.to(self.device),
+                                                 prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+                                                 start_id=start_id,
+                                                 dur_list=dur_list,
+                                                 bnd_list=bnd_list,
+                                                 tone_list=tone_list,
+                                                 f0_list=f0_list,
+                                                 eng_list=eng_list,
+                                                 prompt_feat=prompt_feat.to(self.device),
+                                                 prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+                                                 embedding=embedding.to(self.device),
+                                                 streaming=stream,
+                                                 finalize=finalize)
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            flow_seconds = time.perf_counter() - flow_started
+            flow_detail_metrics = {}
+            for index in range(len(flow_timing_events) - 1):
+                metric_name, started = flow_timing_events[index]
+                _, finished = flow_timing_events[index + 1]
+                flow_detail_metrics[metric_name] = round(started.elapsed_time(finished) / 1000, 3)
             tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
             # append mel cache
             if self.hift_cache_dict[uuid] is not None:
@@ -477,10 +575,20 @@ class CosyVoice3Model(CosyVoice2Model):
             if speed != 1.0:
                 assert token_offset == 0 and finalize is True, 'speed change only support non-stream inference mode'
                 tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            vocoder_started = time.perf_counter()
             tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            vocoder_seconds = time.perf_counter() - vocoder_started
             tts_speech = tts_speech[:, self.hift_cache_dict[uuid]['speech_offset']:]
             self.hift_cache_dict[uuid]['speech_offset'] += tts_speech.shape[1]
-        return tts_speech
+        stage_metrics = {
+            'flow_seconds': round(flow_seconds, 3),
+            'flow_sequence_frames': int((token.shape[1] + prompt_token.shape[1]) * self.flow.token_mel_ratio),
+            'vocoder_seconds': round(vocoder_seconds, 3),
+        }
+        stage_metrics.update(flow_detail_metrics)
+        return tts_speech, stage_metrics
 
     def wordvoice_llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, word_list, start_list, dur_list, bnd_list, tone_list, eng_list, f0_list, uuid):
         cur_silent_token_num, max_silent_token_num = 0, 5
@@ -539,7 +647,7 @@ class CosyVoice3Model(CosyVoice2Model):
         eng_control = [round((e+0.5)/20, 3) for e in eng_list[prompt_words_len:]]
         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
         flow_started = time.perf_counter()
-        this_tts_speech = self.wordvoice_token2wav(token=this_tts_speech_token,
+        this_tts_speech, stage_metrics = self.wordvoice_token2wav(token=this_tts_speech_token,
                                             start_id=start_list[0],
                                             dur_list=dur_list,
                                             bnd_list=bnd_list,
@@ -555,10 +663,12 @@ class CosyVoice3Model(CosyVoice2Model):
                                             speed=speed)
         this_tts_speech = this_tts_speech.cpu()
         flow_seconds = time.perf_counter() - flow_started
-        runtime_metrics = {
+        runtime_metrics: dict[str, Any] = {
             'llm_seconds': round(llm_seconds, 3),
             'flow_vocoder_seconds': round(flow_seconds, 3),
         }
+        runtime_metrics.update(stage_metrics)
+        runtime_metrics.update(self.flow_runtime_metrics)
         if native_runtime_metrics is not None:
             runtime_metrics.update(native_runtime_metrics)
         yield {'tts_speech': this_tts_speech,

@@ -685,6 +685,11 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
                   finalize):
         assert token.shape[0] == 1
         device = token.device
+        timing_events = []
+        if token.is_cuda:
+            timing_started = torch.cuda.Event(enable_timing=True)
+            timing_started.record()
+            timing_events.append(('flow_conditioning_seconds', timing_started))
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -737,6 +742,11 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
+        if token.is_cuda:
+            timing_conditioning = torch.cuda.Event(enable_timing=True)
+            timing_conditioning.record()
+            timing_events.append(('flow_lookahead_seconds', timing_conditioning))
+
         # text encode
         if finalize is True:
             h = self.pre_lookahead_layer(token)
@@ -745,6 +755,11 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
             h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
             # 如果是 streaming 切片，字级特征展开后也要做同样的切片对齐
             token_feat_sliced = batched_token_feat[:, :-self.pre_lookahead_len]
+
+        if token.is_cuda:
+            timing_lookahead = torch.cuda.Event(enable_timing=True)
+            timing_lookahead.record()
+            timing_events.append(('flow_modulation_seconds', timing_lookahead))
 
         # 2. 上采样并融合字级特征 (Upsample & Fusion)
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
@@ -761,6 +776,10 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        if token.is_cuda:
+            timing_modulation = torch.cuda.Event(enable_timing=True)
+            timing_modulation.record()
+            timing_events.append(('flow_diffusion_seconds', timing_modulation))
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
@@ -769,9 +788,13 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
             n_timesteps=10,
             streaming=streaming
         )
+        if token.is_cuda:
+            timing_finished = torch.cuda.Event(enable_timing=True)
+            timing_finished.record()
+            timing_events.append((None, timing_finished))
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat.float(), None
+        return feat.float(), timing_events
 
 
 class DynamicSinusoidalPositionalEncoding(nn.Module):

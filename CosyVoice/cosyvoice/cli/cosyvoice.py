@@ -187,7 +187,7 @@ class CosyVoice2(CosyVoice):
 
 
 class WordVoice(CosyVoice2):
-    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, llm_trt_runtime=None):
+    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, llm_trt_runtime=None, flow_amp_dtype=None):
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
@@ -208,6 +208,10 @@ class WordVoice(CosyVoice2):
         self.sample_rate = configs['sample_rate']
         if torch.cuda.is_available() is False and llm_trt_runtime is not None:
             raise RuntimeError('WordVoice TensorRT decoder requires CUDA')
+        if torch.cuda.is_available() is False and flow_amp_dtype is not None:
+            raise RuntimeError('WordVoice flow AMP requires CUDA')
+        if load_trt is True and flow_amp_dtype is not None:
+            raise ValueError('WordVoice flow TensorRT and flow AMP are mutually exclusive')
         if torch.cuda.is_available() is False and (load_trt is True or fp16 is True):
             load_trt, fp16 = False, False
             logging.warning('no cuda device, set load_trt/fp16 to False')
@@ -230,6 +234,8 @@ class WordVoice(CosyVoice2):
                                 '{}/flow.decoder.estimator.fp32.onnx'.format(model_dir),
                                 trt_concurrent,
                                 self.fp16)
+        if flow_amp_dtype is not None:
+            self.model.enable_wordvoice_flow_amp(flow_amp_dtype)
         del configs
 
     def wordvoice_inference(
