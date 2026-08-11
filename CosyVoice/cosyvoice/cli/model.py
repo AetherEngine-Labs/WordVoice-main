@@ -526,7 +526,9 @@ class CosyVoice3Model(CosyVoice2Model):
             self.tts_speech_token_dict[this_uuid], self.tts_word_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], [], False
             self.hift_cache_dict[this_uuid] = None
 
+        llm_started = time.perf_counter()
         dur_list, bnd_list, tone_list, f0_list, eng_list, pau_list = self.wordvoice_llm_job(text, prompt_text, llm_prompt_speech_token, llm_embedding, word_list, start_list, dur_list, bnd_list, tone_list, eng_list, f0_list, this_uuid)
+        llm_seconds = time.perf_counter() - llm_started
 
         prompt_words_len = len(start_list)
         bnd_control = bnd_list[prompt_words_len:]
@@ -535,6 +537,7 @@ class CosyVoice3Model(CosyVoice2Model):
         f0_control = [round((f-9.5)/10, 3) for f in f0_list[prompt_words_len:]]
         eng_control = [round((e+0.5)/20, 3) for e in eng_list[prompt_words_len:]]
         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+        flow_started = time.perf_counter()
         this_tts_speech = self.wordvoice_token2wav(token=this_tts_speech_token,
                                             start_id=start_list[0],
                                             dur_list=dur_list,
@@ -549,17 +552,20 @@ class CosyVoice3Model(CosyVoice2Model):
                                             uuid=this_uuid,
                                             finalize=True,
                                             speed=speed)
-        yield {'tts_speech': this_tts_speech.cpu(), 
+        this_tts_speech = this_tts_speech.cpu()
+        flow_seconds = time.perf_counter() - flow_started
+        yield {'tts_speech': this_tts_speech,
                'dur_list': dur_control, 
                'bnd_list': bnd_control, 
                'tone_list': tone_control, 
                'f0_list': f0_control, 
-               'eng_list': eng_control}
+               'eng_list': eng_control,
+               'runtime_metrics': {
+                   'llm_seconds': round(llm_seconds, 3),
+                   'flow_vocoder_seconds': round(flow_seconds, 3),
+               }}
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
             self.tts_word_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()

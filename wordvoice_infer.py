@@ -28,6 +28,9 @@ from get_dsp import extract_words_dsp
 from en_punc import english_text_normalization
 from zh_punc import chinese_text_normalization
 
+WORDVOICE_RUNTIME_REVISION = "starline-rtx3060-v1"
+WORDVOICE_UPSTREAM_REVISION = "98b25a64cd0cf9c80b34a1fa8c58a9bcdc786ae6"
+
 logging.basicConfig(level=logging.INFO)
 
 # 定义字级声学边界(Boundary)与音调(Tone)的分类体系
@@ -180,6 +183,7 @@ def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'
     llm_prompt = f'You are a helpful assistant.<|endofprompt|>{prompt_text}'
     
     # 调用 WordVoice 推理接口
+    runtime_metrics = None
     for i, j in enumerate(wordvoice.wordvoice_inference(
             tts_text, llm_prompt, prompt_speech, 
             word_list, start_token_list, dur_list,
@@ -192,6 +196,7 @@ def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'
         f0_list = j['f0_list']
         tone_list = j['tone_list']
         bnd_list = j['bnd_list']
+        runtime_metrics = j.get('runtime_metrics')
 
     # 整理并打印模型最终生成的控制参数字典 (便于用户参考和二次微调)
     generated_control_dict = {
@@ -213,6 +218,7 @@ def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'
     torchaudio.save(save_path, tts_speech, wordvoice.sample_rate)
     print(f"\n[Success] Audio saved to: {save_path}")
     print(f"Time elapsed: {time.time() - s:.2f}s")
+    return runtime_metrics
 
 
 if __name__ == '__main__':

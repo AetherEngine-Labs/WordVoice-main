@@ -548,7 +548,6 @@ class Qwen2LM(TransformerLM):
         # 注意：这里改为 1D tensor，以便后续 logits[:, forbidden_ids] 索引不报错
         forbidden_stop_ids = torch.tensor([self.eos_token], device=device, dtype=torch.long)
         forbidden_bound_ids = torch.tensor([self.bound_token], device=device, dtype=torch.long)
-        negative_inf = torch.tensor(-float('inf'), device=device)
 
         # 准备字特征 (Phase 1)
         style_embs = []
@@ -621,11 +620,17 @@ class Qwen2LM(TransformerLM):
         generate_speech_token = []
         final_dur = dur_list[word_idx-1]
         final_bnd = bnd_list[word_idx-1]
+        prefill_mask = torch.tril(torch.ones(
+            (1, current_input.shape[1], current_input.shape[1]),
+            device=device,
+            dtype=torch.bool,
+        ))
+        decode_mask = torch.ones((1, 1, 1), device=device, dtype=torch.bool)
         for step in range(max_len):
-            # 预填充是大三角，后续全都是 1x1
+            attention_mask = prefill_mask if cache is None else decode_mask
             lm_output, cache = self.llm.forward_one_step(
                 current_input,
-                masks=torch.tril(torch.ones((1, current_input.shape[1], current_input.shape[1]), device=current_input.device)).to(torch.bool),
+                masks=attention_mask,
                 cache=cache
             )
             # logits = self.llm_decoder(lm_output[:, -1, :]) 
@@ -633,36 +638,39 @@ class Qwen2LM(TransformerLM):
             
             # 控制停止符与边界符
             if word_idx < len(word_list):
-                logits[:, forbidden_stop_ids] = negative_inf
+                logits[:, forbidden_stop_ids] = -float('inf')
             # else:
             #     logits[:, forbidden_bound_ids] = negative_inf
             
             if better_infer is True:
                 if true_dur < final_dur:
                     # 比指定的时长短则强制模型输出有声音的token
-                    logits[:, self.silent_tokens] = negative_inf
-                    logits[:, forbidden_bound_ids] = negative_inf
+                    logits[:, self.silent_tokens] = -float('inf')
+                    logits[:, forbidden_bound_ids] = -float('inf')
                 elif true_dur == final_dur:
                     # 留一帧缓冲
-                    logits[:, forbidden_bound_ids] = negative_inf
+                    logits[:, forbidden_bound_ids] = -float('inf')
                 elif true_dur > final_dur:
                     # 最低静音与最大静音设置
                     silent_masks = torch.ones(logits.shape[-1], dtype=torch.bool, device=logits.device)
-                    if true_dur - final_dur < self.max_pause_lens[final_bnd]:
+                    pause_len = true_dur - final_dur
+                    allows_silence = pause_len < self.max_pause_lens[final_bnd]
+                    allows_terminal = pause_len > self.max_pause_lens[final_bnd-1]
+                    if allows_silence:
                         # 到了截止时间段则强制模型输出静音片段
                         silent_masks[self.silent_tokens] = False
-                    if true_dur - final_dur > self.max_pause_lens[final_bnd-1]:
+                    if allows_terminal:
                         # 到了停顿时间自动截停
-                        silent_masks[forbidden_bound_ids] = False
-                        silent_masks[forbidden_stop_ids] = False
-                    if silent_masks.all():
+                        silent_masks[self.bound_token] = False
+                        silent_masks[self.eos_token] = False
+                    if not allows_silence and not allows_terminal:
                         # 如果全被 mask 了，强制允许输出边界符，强行结束当前字的静音
-                        silent_masks[forbidden_bound_ids] = False
+                        silent_masks[self.bound_token] = False
 
-                    logits[:, silent_masks] = negative_inf
+                    logits[:, silent_masks] = -float('inf')
 
             # 采样
-            token_id = self.sampling_ids(logits.log_softmax(dim=-1).squeeze(dim=0), generate_speech_token, sampling, ignore_eos=True if i < min_len else False)
+            token_id = self.sampling_ids(logits.log_softmax(dim=-1).squeeze(dim=0), generate_speech_token, sampling, ignore_eos=True if step < min_len else False)
             if token_id in self.silent_tokens:
                 pau_list[word_idx-1] += 1
 
@@ -679,32 +687,45 @@ class Qwen2LM(TransformerLM):
                 # 1. 既然输出了 bound_token，我们需要先把它送进网络，拿到上下文 Hidden State
                 inner_output, cache = self.llm.forward_one_step(
                     precomputed_bound_emb,
-                    masks=torch.tril(torch.ones((1, precomputed_bound_emb.shape[1], precomputed_bound_emb.shape[1]), device=precomputed_bound_emb.device)).to(torch.bool),
+                    masks=decode_mask,
                     cache=cache
                 )
-                # 2. 提取当前步骤的隐藏状态，过分类器
-                hidden_state = inner_output[:, -1, :] # [1, D]
-                dur_pred_logits = self.duration_predictor(hidden_state) # [1, max_duration+1]
-                bnd_pred_logits = self.boundary_predictor(hidden_state)
-                tone_pred_logits = self.tone_predictor(hidden_state)
-                f0_pred_logits = self.f0_predictor(hidden_state)
-                eng_pred_logits = self.energy_predictor(hidden_state)
-                
-                # 取最大概率的值作为预测结果
-                pred_dur = dur_pred_logits.argmax(dim=-1).item()
-                pred_bnd = bnd_pred_logits.argmax(dim=-1).item()
-                pred_tone = tone_pred_logits.argmax(dim=-1).item()
-                pred_f0 = f0_pred_logits.argmax(dim=-1).item()
-                pred_eng = eng_pred_logits.argmax(dim=-1).item()
-                # print(pred_dur, pred_bnd, pred_tone, pred_f0, pred_eng)
-                
-                # 3. 判断是否使用预测值
                 user_dur = dur_list[word_idx]
                 user_bnd = bnd_list[word_idx]
                 user_tone = tone_list[word_idx]
                 user_f0 = f0_list[word_idx]
                 user_eng = eng_list[word_idx]
-                
+
+                requested_attributes = (
+                    user_dur,
+                    user_bnd,
+                    user_tone,
+                    user_f0,
+                    user_eng,
+                )
+                masked_attributes = (
+                    self.max_duration,
+                    self.max_boundary,
+                    self.max_tone,
+                    self.max_f0,
+                    self.max_energy,
+                )
+                if any(
+                    requested == masked
+                    for requested, masked in zip(requested_attributes, masked_attributes)
+                ):
+                    hidden_state = inner_output[:, -1, :]
+                    predicted_attributes = torch.stack((
+                        self.duration_predictor(hidden_state).argmax(dim=-1),
+                        self.boundary_predictor(hidden_state).argmax(dim=-1),
+                        self.tone_predictor(hidden_state).argmax(dim=-1),
+                        self.f0_predictor(hidden_state).argmax(dim=-1),
+                        self.energy_predictor(hidden_state).argmax(dim=-1),
+                    )).flatten().tolist()
+                else:
+                    predicted_attributes = requested_attributes
+
+                pred_dur, pred_bnd, pred_tone, pred_f0, pred_eng = predicted_attributes
                 final_dur = pred_dur if user_dur == self.max_duration else user_dur # xxh
                 final_bnd = pred_bnd if user_bnd == self.max_boundary else user_bnd
                 final_tone = pred_tone if user_tone == self.max_tone else user_tone
@@ -727,11 +748,16 @@ class Qwen2LM(TransformerLM):
                 
                 # 4. 动态组装 Style Embedding
                 w_emb = word_embs_list[word_idx]
-                d_emb = self.duration_embedding(torch.tensor([final_dur], device=device, dtype=torch.long)).view(-1)
-                b_emb = self.boundary_embedding(torch.tensor([final_bnd], device=device, dtype=torch.long)).view(-1)
-                t_emb = self.tone_embedding(torch.tensor([final_tone], device=device, dtype=torch.long)).view(-1)
-                f_emb = self.f0_embedding(torch.tensor([final_f0], device=device, dtype=torch.long)).view(-1)
-                e_emb = self.energy_embedding(torch.tensor([final_eng], device=device, dtype=torch.long)).view(-1)
+                control_ids = torch.tensor(
+                    [final_dur, final_bnd, final_tone, final_f0, final_eng],
+                    device=device,
+                    dtype=torch.long,
+                )
+                d_emb = self.duration_embedding(control_ids[0:1]).view(-1)
+                b_emb = self.boundary_embedding(control_ids[1:2]).view(-1)
+                t_emb = self.tone_embedding(control_ids[2:3]).view(-1)
+                f_emb = self.f0_embedding(control_ids[3:4]).view(-1)
+                e_emb = self.energy_embedding(control_ids[4:5]).view(-1)
                 
                 dynamic_tot_emb = torch.stack([w_emb, d_emb, b_emb, t_emb, f_emb, e_emb], dim=0).mean(dim=0).view(1, 1, -1)
                 
