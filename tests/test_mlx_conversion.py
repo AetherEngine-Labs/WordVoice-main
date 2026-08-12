@@ -1,6 +1,9 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
+from safetensors.numpy import load_file, save_file
 
 from mlx_wordvoice.convert import convert_flow_state, convert_llm_state
 
@@ -29,7 +32,16 @@ class ConversionTest(unittest.TestCase):
             "control_modulator.2.weight": np.zeros((4, 2)),
         }
         base, controls = convert_flow_state(state)
-        self.assertEqual(base["flow.pre_lookahead_layer.conv1.weight"].shape, (2, 4, 3))
+        converted = base["flow.pre_lookahead_layer.conv1.weight"]
+        self.assertEqual(converted.shape, (2, 4, 3))
+        self.assertTrue(converted.flags.c_contiguous)
+        np.testing.assert_array_equal(converted, np.swapaxes(conv, 1, 2))
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "weights.safetensors"
+            save_file({"weight": converted}, path)
+            np.testing.assert_array_equal(
+                load_file(path)["weight"], np.swapaxes(conv, 1, 2)
+            )
         self.assertIn(
             "flow.decoder.estimator.transformer_blocks.0.attn.to_out_0.weight", base
         )

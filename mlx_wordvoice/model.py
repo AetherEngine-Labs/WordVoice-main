@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,8 +104,15 @@ class WordVoiceMLX(CosyVoice3):
                 "safe_recovery=preserve-request-and-diagnose-vocoder-output"
             )
         duration_seconds = audio_samples / self.sample_rate
+        audio_float = audio.astype(mx.float32)
+        audio_peak = float(mx.max(mx.abs(audio_float)).item())
+        audio_rms = float(mx.sqrt(mx.mean(audio_float * audio_float)).item())
+        audio_peak_dbfs = 20.0 * math.log10(max(audio_peak, 1e-12))
+        audio_rms_dbfs = 20.0 * math.log10(max(audio_rms, 1e-12))
         metrics = {
             **token_result.metrics,
+            "audio_peak_dbfs": round(audio_peak_dbfs, 6),
+            "audio_rms_dbfs": round(audio_rms_dbfs, 6),
             "audio_seconds": round(duration_seconds, 6),
             "flow_seconds": round(flow_seconds, 6),
             "flow_runtime": "compiled-step-v1"
@@ -136,8 +144,11 @@ def load_wordvoice_mlx(
 ) -> WordVoiceMLX:
     model_path = model_path.resolve()
     manifest = json.loads((model_path / "wordvoice.json").read_text(encoding="utf-8"))
-    if manifest.get("contract") != "wordvoice-mlx-model.v1":
-        raise ValueError("unsupported MLX WordVoice model contract")
+    if manifest.get("contract") != "wordvoice-mlx-model.v2":
+        raise ValueError(
+            "unsupported MLX WordVoice model contract; the v1 conversion is rejected "
+            "because non-contiguous Conv1d views were serialized with scrambled kernels"
+        )
     base = load_cosyvoice3(str(model_path), dtype=mx.float16)
     all_weights = mx.load(str(model_path / "model.safetensors"))
     llm = WordVoiceLM(llm=base.llm.llm)
