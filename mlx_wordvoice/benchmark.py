@@ -42,14 +42,25 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=4244)
     parser.add_argument("--compile-flow", action="store_true")
+    parser.add_argument(
+        "--flow-steps",
+        type=int,
+        help="Explicit Euler step count; omit to retain the model's ten-step default",
+    )
     args = parser.parse_args()
+    if args.flow_steps is not None and args.flow_steps < 1:
+        parser.error("--flow-steps must be at least 1")
     output = args.output.resolve()
     if output.exists():
         raise FileExistsError(f"benchmark output already exists: {output}")
     output.mkdir(parents=True)
     request = PreparedRequest.load(args.request)
     load_started = time.perf_counter()
-    model = load_wordvoice_mlx(args.model, compile_flow=args.compile_flow)
+    model = load_wordvoice_mlx(
+        args.model,
+        compile_flow=args.compile_flow,
+        flow_steps=args.flow_steps,
+    )
     load_seconds = time.perf_counter() - load_started
     runs = []
     for label, cache_enabled in (
