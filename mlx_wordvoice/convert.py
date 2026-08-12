@@ -21,6 +21,11 @@ MLX_AUDIO_PLUS_REVISION = "4c9ec6a8489e790b5ba8964ab1f1d63150476f9f"
 MLX_BASE_REVISION = "18ccb7fbd7246e8cd3420d02f5dd28595cc0fcd9"
 WORDVOICE_LLM_SHA256 = "c304f5636ab1ccbe383852c7815d51b3c32dc5ac03125ef8d6fcc54b84e6cf6b"
 WORDVOICE_FLOW_SHA256 = "b644f444ae551b938e82e1dd38fa7d2e1925715e297b5ccd0b232e138a6035ad"
+PYTORCH_RAND_NOISE_SEED = 0
+PYTORCH_RAND_NOISE_SHAPE = (1, 80, 50 * 300)
+PYTORCH_RAND_NOISE_VALUES_SHA256 = (
+    "656c9256457b71d1621f32d64715e922c656670185e70b457f7734e2c4da0b95"
+)
 
 LLM_CONTROL_PREFIXES = (
     "boundary_embedding.",
@@ -134,6 +139,26 @@ def _torch_state(path: Path) -> dict[str, np.ndarray]:
     return result
 
 
+def build_pytorch_rand_noise() -> np.ndarray:
+    """Reproduce the fixed noise created by PyTorch CausalConditionalCFM."""
+    import torch
+
+    generator = torch.Generator(device="cpu").manual_seed(PYTORCH_RAND_NOISE_SEED)
+    noise = torch.randn(
+        PYTORCH_RAND_NOISE_SHAPE,
+        dtype=torch.float32,
+        device="cpu",
+        generator=generator,
+    ).numpy()
+    actual = hashlib.sha256(noise.tobytes()).hexdigest()
+    if actual != PYTORCH_RAND_NOISE_VALUES_SHA256:
+        raise RuntimeError(
+            "PyTorch fixed diffusion noise does not match the admitted values: "
+            f"expected {PYTORCH_RAND_NOISE_VALUES_SHA256}, actual {actual}"
+        )
+    return noise
+
+
 def _verify_file(path: Path, expected_sha256: str, role: str) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"missing {role}: {path}")
@@ -172,6 +197,7 @@ def convert(
     }
     llm_base, llm_controls = convert_llm_state(_torch_state(llm_checkpoint))
     flow_base, flow_controls = convert_flow_state(_torch_state(flow_checkpoint))
+    rand_noise = build_pytorch_rand_noise()
     converted = {
         key: np.ascontiguousarray(value)
         for key, value in {
@@ -203,7 +229,7 @@ def convert(
             converted,
             temporary / "model.safetensors",
             metadata={
-                "format": "wordvoice-mlx-fp16-v2",
+                "format": "wordvoice-mlx-fp16-v3",
                 "mlx_audio_plus_revision": MLX_AUDIO_PLUS_REVISION,
                 "mlx_base_revision": MLX_BASE_REVISION,
                 "wordvoice_model_revision": WORDVOICE_MODEL_REVISION,
@@ -211,23 +237,40 @@ def convert(
             },
         )
         for source in base_model.iterdir():
-            if source.name == "model.safetensors" or not source.is_file():
+            if (
+                source.name in {"model.safetensors", "rand_noise.npy"}
+                or not source.is_file()
+            ):
                 continue
             shutil.copy2(source, temporary / source.name)
+        rand_noise_path = temporary / "rand_noise.npy"
+        np.save(rand_noise_path, rand_noise)
         model_path = temporary / "model.safetensors"
         manifest = {
-            "contract": "wordvoice-mlx-model.v2",
-            "dtype": "float16",
+            "contract": "wordvoice-mlx-model.v3",
+            "dtypes": {
+                "rand_noise": "float32",
+                "weights": "float16",
+            },
             "files": {
                 "model.safetensors": {
                     "bytes": model_path.stat().st_size,
                     "sha256": sha256_file(model_path),
+                },
+                "rand_noise.npy": {
+                    "bytes": rand_noise_path.stat().st_size,
+                    "sha256": sha256_file(rand_noise_path),
                 }
             },
             "inputs": {
                 "mlx_audio_plus_revision": MLX_AUDIO_PLUS_REVISION,
                 "mlx_base_model_revision": MLX_BASE_REVISION,
                 "mlx_base_model_sha256": sha256_file(base_weights_path),
+                "pytorch_rand_noise_seed": PYTORCH_RAND_NOISE_SEED,
+                "pytorch_rand_noise_shape": list(PYTORCH_RAND_NOISE_SHAPE),
+                "pytorch_rand_noise_values_sha256": (
+                    PYTORCH_RAND_NOISE_VALUES_SHA256
+                ),
                 "wordvoice_flow_sha256": WORDVOICE_FLOW_SHA256,
                 "wordvoice_llm_sha256": WORDVOICE_LLM_SHA256,
                 "wordvoice_model_revision": WORDVOICE_MODEL_REVISION,

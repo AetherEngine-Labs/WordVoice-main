@@ -17,6 +17,7 @@ from mlx_audio.tts.models.cosyvoice3 import CosyVoice3, load_cosyvoice3
 from .contract import PreparedRequest
 from .flow import WordVoiceFlow
 from .llm import WordVoiceLM
+from .model_manifest import validate_model_manifest
 
 
 @dataclass(frozen=True)
@@ -143,13 +144,12 @@ def load_wordvoice_mlx(
     model_path: Path, *, compile_flow: bool = False
 ) -> WordVoiceMLX:
     model_path = model_path.resolve()
-    manifest = json.loads((model_path / "wordvoice.json").read_text(encoding="utf-8"))
-    if manifest.get("contract") != "wordvoice-mlx-model.v2":
-        raise ValueError(
-            "unsupported MLX WordVoice model contract; the v1 conversion is rejected "
-            "because non-contiguous Conv1d views were serialized with scrambled kernels"
-        )
+    validate_model_manifest(model_path)
     base = load_cosyvoice3(str(model_path), dtype=mx.float16)
+    if base.flow.decoder._rand_noise is None:
+        raise RuntimeError(
+            "MLX CosyVoice3 did not load the required fixed diffusion-noise tensor"
+        )
     all_weights = mx.load(str(model_path / "model.safetensors"))
     llm = WordVoiceLM(llm=base.llm.llm)
     llm_weights = {

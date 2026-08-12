@@ -33,7 +33,7 @@ AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-convert \
   --base-model /absolute/path/to/mlx-cosyvoice3-base \
   --llm-checkpoint /absolute/path/to/wordvoice_llm_en.pt \
   --flow-checkpoint /absolute/path/to/wordvoice_fm.pt \
-  --destination /absolute/path/to/wordvoice-mlx-fp16-v2
+  --destination /absolute/path/to/wordvoice-mlx-fp16-v3
 ```
 
 The generated `wordvoice.json` records every source revision, checkpoint hash,
@@ -42,8 +42,12 @@ the tensor count, model byte count, and converted model SHA-256.
 The v1 conversion is rejected. Its non-contiguous NumPy Conv1d views were
 serialized in the wrong byte order, scrambling the pre-lookahead and DiT
 convolution kernels even though their tensor names and shapes looked valid.
-The v2 converter materializes every tensor in contiguous MLX layout before
-writing safetensors and the runtime refuses to load a v1 manifest.
+The v2 conversion repaired those kernels but omitted the fixed diffusion-noise
+tensor created by PyTorch's `CausalConditionalCFM`. MLX then generated a
+different tensor with its own random-number generator, so nearly identical
+conditioning still produced a measurably different final mel. The v3 converter
+materializes every tensor in contiguous MLX layout, reproduces and records the
+exact PyTorch noise tensor, and refuses both superseded contracts.
 
 ## Export an exact request
 
@@ -80,7 +84,7 @@ AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-qualify \
 ~/.ainotebook/wordvoice-mlx-venv/bin/python \
   -X agent.owner=operator -X agent.task=wordvoice-mlx-qualify \
   -m mlx_wordvoice.benchmark \
-  --model /absolute/path/to/wordvoice-mlx-fp16-v2 \
+  --model /absolute/path/to/wordvoice-mlx-fp16-v3 \
   --request /absolute/path/to/prepared-request \
   --output /absolute/path/to/qualification \
   --seed 4244 \
