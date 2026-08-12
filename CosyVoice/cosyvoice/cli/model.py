@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 from typing import Any, Generator, cast
 import torch
@@ -664,6 +665,16 @@ class CosyVoice3Model(CosyVoice2Model):
         f0_control = [round((f-9.5)/10, 3) for f in f0_list[prompt_words_len:]]
         eng_control = [round((e+0.5)/20, 3) for e in eng_list[prompt_words_len:]]
         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+        speech_token_sha256 = hashlib.sha256(
+            this_tts_speech_token.contiguous().numpy().tobytes()
+        ).hexdigest()
+        prosody_control_sha256 = hashlib.sha256(repr((
+            tuple(dur_control),
+            tuple(bnd_control),
+            tuple(tone_control),
+            tuple(f0_control),
+            tuple(eng_control),
+        )).encode('utf-8')).hexdigest()
         flow_started = time.perf_counter()
         this_tts_speech, stage_metrics = self.wordvoice_token2wav(token=this_tts_speech_token,
                                             start_id=start_list[0],
@@ -684,6 +695,9 @@ class CosyVoice3Model(CosyVoice2Model):
         runtime_metrics: dict[str, Any] = {
             'llm_seconds': round(llm_seconds, 3),
             'flow_vocoder_seconds': round(flow_seconds, 3),
+            'speech_token_count': int(this_tts_speech_token.shape[1]),
+            'speech_token_sha256': speech_token_sha256,
+            'prosody_control_sha256': prosody_control_sha256,
         }
         runtime_metrics.update(stage_metrics)
         runtime_metrics.update(self.flow_runtime_metrics)
