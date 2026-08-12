@@ -119,6 +119,7 @@ class WordVoiceMLX(CosyVoice3):
             "flow_runtime": "compiled-step-v1"
             if self.flow.compilation_enabled
             else "eager",
+            "flow_steps": self.flow.n_timesteps,
             "llm_seconds": round(llm_seconds, 6),
             "model_seconds": round(llm_seconds + flow_seconds + vocoder_seconds, 6),
             "prosody_control_sha256": control_hash,
@@ -141,9 +142,17 @@ class WordVoiceMLX(CosyVoice3):
 
 
 def load_wordvoice_mlx(
-    model_path: Path, *, compile_flow: bool = False
+    model_path: Path,
+    *,
+    compile_flow: bool = False,
+    flow_steps: int | None = None,
 ) -> WordVoiceMLX:
     model_path = model_path.resolve()
+    if flow_steps is not None and flow_steps < 1:
+        raise ValueError(
+            "MLX WordVoice flow_steps must be at least 1; "
+            f"actual={flow_steps}, safe_recovery=omit-flow_steps-for-model-default"
+        )
     validate_model_manifest(model_path)
     base = load_cosyvoice3(str(model_path), dtype=mx.float16)
     if base.flow.decoder._rand_noise is None:
@@ -187,7 +196,7 @@ def load_wordvoice_mlx(
         pre_lookahead_len=base.flow.pre_lookahead_len,
         pre_lookahead_layer=base.flow.pre_lookahead_layer,
         decoder=base.flow.decoder,
-        n_timesteps=base.flow.n_timesteps,
+        n_timesteps=base.flow.n_timesteps if flow_steps is None else flow_steps,
     )
     flow_weights = {
         key[5:]: value

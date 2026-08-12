@@ -82,7 +82,7 @@ class PreparedPrefixTest(unittest.TestCase):
         first_metrics = self.model.consume_prepared_prefix_metrics()
         second = self.infer("request-a")
         second_metrics = self.model.consume_prepared_prefix_metrics()
-        third = self.infer("request-b")
+        self.infer("request-b")
         third_metrics = self.model.consume_prepared_prefix_metrics()
 
         self.assertEqual(first, second)
