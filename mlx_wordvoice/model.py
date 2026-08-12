@@ -96,7 +96,13 @@ class WordVoiceMLX(CosyVoice3):
             json.dumps(plan, separators=(",", ":"), sort_keys=True).encode("utf-8")
         ).hexdigest()
         target_frames = int(mel.shape[2])
-        duration_seconds = int(audio.shape[-1]) / self.sample_rate
+        audio_samples = int(audio.shape[-1])
+        if audio_samples <= 0:
+            raise RuntimeError(
+                "WordVoice vocoder produced no audio samples; "
+                "safe_recovery=preserve-request-and-diagnose-vocoder-output"
+            )
+        duration_seconds = audio_samples / self.sample_rate
         metrics = {
             **token_result.metrics,
             "audio_seconds": round(duration_seconds, 6),
