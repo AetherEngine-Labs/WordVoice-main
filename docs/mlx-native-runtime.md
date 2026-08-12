@@ -33,11 +33,17 @@ AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-convert \
   --base-model /absolute/path/to/mlx-cosyvoice3-base \
   --llm-checkpoint /absolute/path/to/wordvoice_llm_en.pt \
   --flow-checkpoint /absolute/path/to/wordvoice_fm.pt \
-  --destination /absolute/path/to/wordvoice-mlx-fp16-v1
+  --destination /absolute/path/to/wordvoice-mlx-fp16-v2
 ```
 
 The generated `wordvoice.json` records every source revision, checkpoint hash,
 the tensor count, model byte count, and converted model SHA-256.
+
+The v1 conversion is rejected. Its non-contiguous NumPy Conv1d views were
+serialized in the wrong byte order, scrambling the pre-lookahead and DiT
+convolution kernels even though their tensor names and shapes looked valid.
+The v2 converter materializes every tensor in contiguous MLX layout before
+writing safetensors and the runtime refuses to load a v1 manifest.
 
 ## Export an exact request
 
@@ -74,13 +80,15 @@ AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-qualify \
 ~/.ainotebook/wordvoice-mlx-venv/bin/python \
   -X agent.owner=operator -X agent.task=wordvoice-mlx-qualify \
   -m mlx_wordvoice.benchmark \
-  --model /absolute/path/to/wordvoice-mlx-fp16-v1 \
+  --model /absolute/path/to/wordvoice-mlx-fp16-v2 \
   --request /absolute/path/to/prepared-request \
   --output /absolute/path/to/qualification \
   --seed 4244 \
   --compile-flow
 ```
 
-The resulting `qualification.json` is the durable parity and performance
-receipt. Production admission still requires a representative listening test;
-successful token/control parity alone is not a voice-quality approval.
+The resulting `qualification.json` is the durable cache-parity and performance
+receipt. It also rejects technically inactive audio below the declared peak and
+RMS floors. Production admission still requires a representative listening
+test; successful token/control and activity gates are not voice-quality
+approval.

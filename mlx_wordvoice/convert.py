@@ -54,7 +54,11 @@ def sha256_file(path: Path) -> str:
 
 
 def transpose_conv_weight(weight: np.ndarray) -> np.ndarray:
-    return np.swapaxes(weight, 1, 2)
+    # np.swapaxes returns a strided view. safetensors 0.8 serializes that view
+    # using its underlying contiguous byte order while retaining the swapped
+    # shape, which silently scrambles every converted Conv1d kernel. Materialize
+    # the MLX (out, kernel, in) layout before it reaches save_file.
+    return np.ascontiguousarray(np.swapaxes(weight, 1, 2))
 
 
 def convert_llm_state(
@@ -168,7 +172,16 @@ def convert(
     }
     llm_base, llm_controls = convert_llm_state(_torch_state(llm_checkpoint))
     flow_base, flow_controls = convert_flow_state(_torch_state(flow_checkpoint))
-    converted = {**retained, **llm_base, **flow_base, **llm_controls, **flow_controls}
+    converted = {
+        key: np.ascontiguousarray(value)
+        for key, value in {
+            **retained,
+            **llm_base,
+            **flow_base,
+            **llm_controls,
+            **flow_controls,
+        }.items()
+    }
 
     required_prefixes = (
         "qwen2.",
@@ -190,7 +203,7 @@ def convert(
             converted,
             temporary / "model.safetensors",
             metadata={
-                "format": "wordvoice-mlx-fp16-v1",
+                "format": "wordvoice-mlx-fp16-v2",
                 "mlx_audio_plus_revision": MLX_AUDIO_PLUS_REVISION,
                 "mlx_base_revision": MLX_BASE_REVISION,
                 "wordvoice_model_revision": WORDVOICE_MODEL_REVISION,
@@ -203,7 +216,7 @@ def convert(
             shutil.copy2(source, temporary / source.name)
         model_path = temporary / "model.safetensors"
         manifest = {
-            "contract": "wordvoice-mlx-model.v1",
+            "contract": "wordvoice-mlx-model.v2",
             "dtype": "float16",
             "files": {
                 "model.safetensors": {

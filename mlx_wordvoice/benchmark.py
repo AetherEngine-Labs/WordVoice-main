@@ -16,6 +16,17 @@ from .contract import PreparedRequest
 from .model import load_wordvoice_mlx
 
 
+MIN_AUDIO_PEAK_DBFS = -18.0
+MIN_AUDIO_RMS_DBFS = -40.0
+
+
+def metric_float(metrics: dict[str, object], name: str) -> float:
+    value = metrics.get(name)
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"MLX WordVoice metric {name!r} must be numeric, actual={value!r}")
+    return float(value)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -66,6 +77,16 @@ def main() -> int:
         runs.append(run)
         print(json.dumps(run, sort_keys=True), flush=True)
 
+        peak_dbfs = metric_float(result.metrics, "audio_peak_dbfs")
+        rms_dbfs = metric_float(result.metrics, "audio_rms_dbfs")
+        if peak_dbfs < MIN_AUDIO_PEAK_DBFS or rms_dbfs < MIN_AUDIO_RMS_DBFS:
+            raise RuntimeError(
+                "MLX WordVoice audio activity gate failed: "
+                f"peak_dbfs={peak_dbfs:.3f} (minimum {MIN_AUDIO_PEAK_DBFS:.3f}), "
+                f"rms_dbfs={rms_dbfs:.3f} (minimum {MIN_AUDIO_RMS_DBFS:.3f}); "
+                "safe_recovery=preserve-output-and-diagnose-flow-before-listening"
+            )
+
     token_hashes = {run["metrics"]["speech_token_sha256"] for run in runs}
     control_hashes = {run["metrics"]["prosody_control_sha256"] for run in runs}
     token_counts = {run["metrics"]["speech_token_count"] for run in runs}
@@ -77,16 +98,21 @@ def main() -> int:
             f"speech_token_count={sorted(token_counts)}"
         )
     receipt = {
-        "contract": "wordvoice-mlx-qualification.v1",
+        "contract": "wordvoice-mlx-qualification.v2",
         "load_seconds": round(load_seconds, 6),
         "model_manifest": json.loads(
             (args.model / "wordvoice.json").read_text(encoding="utf-8")
         ),
         "parity": {
+            "audio_activity_gate": "passed",
             "prosody_control_sha256": next(iter(control_hashes)),
             "speech_token_count": next(iter(token_counts)),
             "speech_token_sha256": next(iter(token_hashes)),
             "status": "passed",
+        },
+        "production_admission": {
+            "listening_approval": "required",
+            "status": "awaiting-human-listening",
         },
         "request_fingerprint": request.fingerprint(),
         "runs": runs,
