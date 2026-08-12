@@ -97,10 +97,10 @@ RMS floors. Production admission still requires a representative listening
 test; successful token/control and activity gates are not voice-quality
 approval.
 
-Ten Euler flow steps remain the quality-default model contract. An explicit
-`--flow-steps 8` profile is available for bounded performance auditions. On the
-27.28-second fixed PyTorch token/control plan, eight steps reduced same-process
-flow time by 25.4% and retained a ten-step mel cosine of 0.999929. Whisper
-tiny.en produced the same relative WER for both samples. These mechanical gates
-do not approve the faster profile: promote it only after listening to the
-representative audition, and keep ten steps when `--flow-steps` is omitted.
+Eight Euler flow steps are the production default approved by Alexander after
+listening to the representative 27.28-second audition on 2026-08-13. On its
+fixed PyTorch token/control plan, eight steps reduced same-process flow time by
+25.4% and retained a ten-step mel cosine of 0.999929. Whisper tiny.en produced
+the same relative WER for both samples. Omit `--flow-steps` for the approved
+eight-step production profile; use explicit `--flow-steps 10` only when the
+ten-step quality-reference profile is required for comparison or diagnosis.
