@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os, queue
 import random
 import time
 import threading
+from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List, Generator
 import numpy as np
 import torch
@@ -31,6 +33,46 @@ from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
 from cosyvoice.utils.losses import DynamicStyleLoss
+
+
+@dataclass(frozen=True)
+class PreparedWordVoicePrefix:
+    key: str
+    hidden: torch.Tensor
+    cache: tuple
+    word_embeddings: tuple[torch.Tensor, ...]
+    word_index: int
+    preceding_duration: int
+    durations: tuple[int, ...]
+    boundaries: tuple[int, ...]
+    tones: tuple[int, ...]
+    energies: tuple[int, ...]
+    pitches: tuple[int, ...]
+    final_duration: int
+    final_boundary: int
+    prepare_seconds: float
+    retained_bytes: int
+
+
+def _hash_tensor(digest, name: str, tensor: torch.Tensor) -> None:
+    value = tensor.detach().cpu().contiguous()
+    digest.update(name.encode('utf-8'))
+    digest.update(str(value.dtype).encode('ascii'))
+    digest.update(repr(tuple(value.shape)).encode('ascii'))
+    digest.update(value.view(torch.uint8).numpy().tobytes())
+
+
+def _cache_tuple(cache) -> tuple:
+    legacy = cache.to_legacy_cache() if hasattr(cache, 'to_legacy_cache') else cache
+    return tuple((key, value) for key, value in legacy)
+
+
+def _tensor_bytes(value) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(item) for item in value)
+    return 0
 
 class TransformerLM(torch.nn.Module):
     def __init__(
@@ -512,6 +554,47 @@ class Qwen2LM(TransformerLM):
         return {'loss': total_loss, 'speech_loss': speech_loss, 'acc': acc, 'dur_loss': dur_loss, 
                 'bnd_loss': bnd_loss, 'tone_loss': tone_loss, 'f0_loss': f0_loss, 'eng_loss': eng_loss}
 
+    def prepared_prefix_key(
+            self,
+            text: torch.Tensor,
+            prompt_text: torch.Tensor,
+            prompt_speech_token: torch.Tensor,
+            word_list: List[torch.Tensor],
+            start_list: List[int],
+            dur_list: List[int],
+            bnd_list: List[int],
+            tone_list: List[int],
+            eng_list: List[int],
+            f0_list: List[int],
+            embedding: torch.Tensor,
+    ) -> str:
+        digest = hashlib.sha256()
+        for name, tensor in (
+                ('text', text),
+                ('prompt_text', prompt_text),
+                ('prompt_speech_token', prompt_speech_token),
+                ('embedding', embedding),
+        ):
+            _hash_tensor(digest, name, tensor)
+        for index, word in enumerate(word_list):
+            _hash_tensor(digest, f'word_{index}', word)
+        for name, values in (
+                ('starts', start_list),
+                ('durations', dur_list),
+                ('boundaries', bnd_list),
+                ('tones', tone_list),
+                ('energies', eng_list),
+                ('pitches', f0_list),
+        ):
+            digest.update(name.encode('ascii'))
+            digest.update(repr(tuple(values)).encode('ascii'))
+        return digest.hexdigest()
+
+    def consume_prepared_prefix_metrics(self):
+        metrics = self._prepared_prefix_metrics
+        self._prepared_prefix_metrics = None
+        return metrics
+
     @torch.inference_mode()
     def base_inference(
             self,
@@ -533,13 +616,14 @@ class Qwen2LM(TransformerLM):
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
             uuid: str = '',
-            better_infer = True
+            better_infer = True,
+            prepared_prefix_key: str = '',
+            prepared_prefix_fingerprint_seconds: float = 0.0,
     ) -> Generator[torch.Tensor, None, None]:
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
         text_len += prompt_text_len
-        text_emb = self.llm.model.model.embed_tokens(text)
-        
+
         if self.__class__.__name__ == 'CosyVoice3LM':
             assert 151646 in text, '<|endofprompt|> not detected in CosyVoice3 text or prompt_text, check your input!'
 
@@ -549,90 +633,157 @@ class Qwen2LM(TransformerLM):
         forbidden_stop_ids = torch.tensor([self.eos_token], device=device, dtype=torch.long)
         forbidden_bound_ids = torch.tensor([self.bound_token], device=device, dtype=torch.long)
 
-        # 准备字特征 (Phase 1)
-        style_embs = []
-        word_embs_list = [] # 新增：保存纯净的字特征，用于后续动态生成 style_emb
-        pau_list = [0] * len(word_list)
-        
-        for i in range(len(word_list)):
-            w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
-            word_embs_list.append(w_emb)
-            
-            # 此处 style_embs 仅用于组装 Prompt 部分（Prompt 部分通常不包含 MASK）
-            # 对于后续自回归部分，若遇到 MASK，会在下方动态重新计算
-            d = torch.tensor([dur_list[i]], device=device, dtype=torch.long)
-            d = torch.clamp(d, 0, self.max_duration - 1)
-            b = torch.tensor([bnd_list[i]], device=device, dtype=torch.long)
-            t = torch.tensor([tone_list[i]], device=device, dtype=torch.long)
-            e = torch.tensor([eng_list[i]], device=device, dtype=torch.long)
-            f = torch.tensor([f0_list[i]], device=device, dtype=torch.long)
-            
-            d_emb = self.duration_embedding(d).view(-1)
-            b_emb = self.boundary_embedding(b).view(-1)
-            t_emb = self.tone_embedding(t).view(-1)
-            e_emb = self.energy_embedding(e).view(-1)
-            f_emb = self.f0_embedding(f).view(-1)
-            
-            style_emb = torch.stack([w_emb, d_emb, b_emb, t_emb, f_emb, e_emb], dim=0).mean(dim=0).view(1, 1, -1)
-            style_embs.append(style_emb)
+        reuse_enabled = bool(
+            prepared_prefix_key
+            and getattr(self.llm, 'native_decoder', None) is not None
+        )
+        prefix = self._prepared_prefix
+        cache_hit = bool(reuse_enabled and prefix is not None and prefix.key == prepared_prefix_key)
+        if not cache_hit:
+            prepare_started = time.perf_counter()
+            text_emb = self.llm.model.model.embed_tokens(text)
+            style_embs = []
+            word_embs_list = []
+            for i in range(len(word_list)):
+                w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
+                word_embs_list.append(w_emb)
+                d = torch.clamp(
+                    torch.tensor([dur_list[i]], device=device, dtype=torch.long),
+                    0,
+                    self.max_duration - 1,
+                )
+                b = torch.tensor([bnd_list[i]], device=device, dtype=torch.long)
+                t = torch.tensor([tone_list[i]], device=device, dtype=torch.long)
+                e = torch.tensor([eng_list[i]], device=device, dtype=torch.long)
+                f = torch.tensor([f0_list[i]], device=device, dtype=torch.long)
+                style_embs.append(torch.stack([
+                    w_emb,
+                    self.duration_embedding(d).view(-1),
+                    self.boundary_embedding(b).view(-1),
+                    self.tone_embedding(t).view(-1),
+                    self.f0_embedding(f).view(-1),
+                    self.energy_embedding(e).view(-1),
+                ], dim=0).mean(dim=0).view(1, 1, -1))
 
-        # 准备 Prompt (Phase 2)
-        word_idx = 0
-        prompt_embs_list = []
-        P = prompt_speech_token_len.item() if isinstance(prompt_speech_token_len, torch.Tensor) else prompt_speech_token_len
-
-        if P > 0:
-            p_speech_emb = self.speech_embedding(prompt_speech_token).squeeze(0)
-            pre_dur=0
-            for i in range(P): # 插入字级标签
-                if word_idx < len(start_list) and start_list[word_idx] == i:
+            word_idx = 0
+            prompt_embs_list = []
+            P = prompt_speech_token_len.item() if isinstance(prompt_speech_token_len, torch.Tensor) else prompt_speech_token_len
+            pre_dur = 0
+            if P > 0:
+                p_speech_emb = self.speech_embedding(prompt_speech_token).squeeze(0)
+                for i in range(P):
+                    if word_idx < len(start_list) and start_list[word_idx] == i:
+                        prompt_embs_list.append(self.speech_embedding.weight[self.bound_token])
+                        prompt_embs_list.append(style_embs[word_idx].view(-1))
+                        if word_idx > 0:
+                            dur_list[word_idx-1] = pre_dur
+                            pre_dur = 0
+                        word_idx += 1
+                    if word_idx > 0:
+                        pre_dur += 1
+                    prompt_embs_list.append(p_speech_emb[i])
+                while word_idx < len(start_list) and start_list[word_idx] == P:
                     prompt_embs_list.append(self.speech_embedding.weight[self.bound_token])
                     prompt_embs_list.append(style_embs[word_idx].view(-1))
-                    if word_idx > 0:
-                        dur_list[word_idx-1] = pre_dur # 更新前一个字的时长为实际值
-                        pre_dur = 0
+                    dur_list[word_idx-1] = pre_dur
+                    pre_dur = 0
                     word_idx += 1
-                if word_idx > 0:
-                    pre_dur += 1 
-                prompt_embs_list.append(p_speech_emb[i])
-            
-            while word_idx < len(start_list) and start_list[word_idx] == P: # 补上没处理完的字级提示
-                prompt_embs_list.append(self.speech_embedding.weight[self.bound_token])
-                prompt_embs_list.append(style_embs[word_idx].view(-1))
-                dur_list[word_idx-1] = pre_dur
-                pre_dur = 0
-                word_idx += 1
-            prompt_speech_token_emb = torch.stack(prompt_embs_list, dim=0).unsqueeze(0)
-        else:
-            prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=text_emb.dtype).to(device)
+                prompt_speech_token_emb = torch.stack(prompt_embs_list, dim=0).unsqueeze(0)
+            else:
+                prompt_speech_token_emb = torch.zeros(
+                    1, 0, self.llm_input_size, dtype=text_emb.dtype, device=device
+                )
 
-        # 拼接初始 LLM Input
-        sos_emb = self.speech_embedding.weight[self.sos].reshape(1, 1, -1)
-        task_id_emb = self.speech_embedding.weight[self.task_id].reshape(1, 1, -1)
-        current_input = torch.concat([sos_emb, text_emb, task_id_emb, prompt_speech_token_emb], dim=1)
+            current_input = torch.concat([
+                self.speech_embedding.weight[self.sos].reshape(1, 1, -1),
+                text_emb,
+                self.speech_embedding.weight[self.task_id].reshape(1, 1, -1),
+                prompt_speech_token_emb,
+            ], dim=1)
+            prefill_mask = torch.tril(torch.ones(
+                (1, current_input.shape[1], current_input.shape[1]),
+                device=device,
+                dtype=torch.bool,
+            ))
+            hidden, cache = self.llm.forward_one_step(
+                current_input,
+                masks=prefill_mask,
+                cache=None,
+            )
+            if hidden.is_cuda:
+                torch.cuda.current_stream(hidden.device).synchronize()
+            immutable_cache = _cache_tuple(cache)
+            prepare_seconds = time.perf_counter() - prepare_started
+            last_hidden = hidden[:, -1:, :].clone()
+            prefix = PreparedWordVoicePrefix(
+                key=prepared_prefix_key,
+                hidden=last_hidden,
+                cache=immutable_cache,
+                word_embeddings=tuple(word_embs_list),
+                word_index=word_idx,
+                preceding_duration=pre_dur,
+                durations=tuple(dur_list),
+                boundaries=tuple(bnd_list),
+                tones=tuple(tone_list),
+                energies=tuple(eng_list),
+                pitches=tuple(f0_list),
+                final_duration=dur_list[word_idx-1],
+                final_boundary=bnd_list[word_idx-1],
+                prepare_seconds=prepare_seconds,
+                retained_bytes=(
+                    _tensor_bytes(last_hidden)
+                    + _tensor_bytes(immutable_cache)
+                    + _tensor_bytes(word_embs_list)
+                ),
+            )
+            if reuse_enabled:
+                self._prepared_prefix = prefix
+                self._prepared_prefix_misses += 1
+        else:
+            self._prepared_prefix_hits += 1
+
+        restore_started = time.perf_counter()
+        dur_list = list(prefix.durations)
+        bnd_list = list(prefix.boundaries)
+        tone_list = list(prefix.tones)
+        eng_list = list(prefix.energies)
+        f0_list = list(prefix.pitches)
+        word_embs_list = prefix.word_embeddings
+        word_idx = prefix.word_index
+        pre_dur = prefix.preceding_duration
+        final_dur = prefix.final_duration
+        final_bnd = prefix.final_boundary
+        cache = prefix.cache
+        prefill_hidden = prefix.hidden
+        pau_list = [0] * len(word_list)
+        restore_seconds = time.perf_counter() - restore_started
+        self._prepared_prefix_metrics = {
+            'prepared_prefix_cache': 'hit' if cache_hit else ('miss' if reuse_enabled else 'disabled'),
+            'prepared_prefix_cache_hit': cache_hit,
+            'prepared_prefix_fingerprint_seconds': round(prepared_prefix_fingerprint_seconds, 6),
+            'prepared_prefix_prepare_seconds': round(0.0 if cache_hit else prefix.prepare_seconds, 6),
+            'prepared_prefix_source_prepare_seconds': round(prefix.prepare_seconds, 6),
+            'prepared_prefix_restore_seconds': round(restore_seconds, 6),
+            'prepared_prefix_retained_bytes': prefix.retained_bytes if reuse_enabled else 0,
+            'prepared_prefix_hits': self._prepared_prefix_hits,
+            'prepared_prefix_misses': self._prepared_prefix_misses,
+        }
 
         # 开始推理：Prefill & Decode
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
         max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
-        
-        cache = None        
         true_dur = pre_dur
         generate_speech_token = []
-        final_dur = dur_list[word_idx-1]
-        final_bnd = bnd_list[word_idx-1]
-        prefill_mask = torch.tril(torch.ones(
-            (1, current_input.shape[1], current_input.shape[1]),
-            device=device,
-            dtype=torch.bool,
-        ))
         decode_mask = torch.ones((1, 1, 1), device=device, dtype=torch.bool)
         for step in range(max_len):
-            attention_mask = prefill_mask if cache is None else decode_mask
-            lm_output, cache = self.llm.forward_one_step(
-                current_input,
-                masks=attention_mask,
-                cache=cache
-            )
+            if step == 0:
+                lm_output = prefill_hidden
+            else:
+                lm_output, cache = self.llm.forward_one_step(
+                    current_input,
+                    masks=decode_mask,
+                    cache=cache
+                )
             # logits = self.llm_decoder(lm_output[:, -1, :]) 
             logits = self.llm_decoder(lm_output[:, -1])
             
@@ -859,5 +1010,9 @@ class WordVoiceLM(Qwen2LM):
         # 5. vllm related
         self.stop_token_ids = [speech_token_size + i for i in range(200)]
         self.vllm_output_queue = {}
+        self._prepared_prefix = None
+        self._prepared_prefix_metrics = None
+        self._prepared_prefix_hits = 0
+        self._prepared_prefix_misses = 0
         if online_feature is True:
             self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v3.batch.onnx'))

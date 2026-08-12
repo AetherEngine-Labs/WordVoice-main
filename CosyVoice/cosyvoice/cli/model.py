@@ -592,6 +592,21 @@ class CosyVoice3Model(CosyVoice2Model):
 
     def wordvoice_llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, word_list, start_list, dur_list, bnd_list, tone_list, eng_list, f0_list, uuid):
         cur_silent_token_num, max_silent_token_num = 0, 5
+        fingerprint_started = time.perf_counter()
+        prepared_prefix_key = self.llm.prepared_prefix_key(
+            text,
+            prompt_text,
+            llm_prompt_speech_token,
+            word_list,
+            start_list,
+            dur_list,
+            bnd_list,
+            tone_list,
+            eng_list,
+            f0_list,
+            llm_embedding,
+        )
+        fingerprint_seconds = time.perf_counter() - fingerprint_started
         with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
             (
                 self.tts_speech_token_dict[uuid],
@@ -616,7 +631,9 @@ class CosyVoice3Model(CosyVoice2Model):
                     eng_list=eng_list,
                     f0_list=f0_list,
                     embedding=llm_embedding.to(self.device),
-                    uuid=uuid)
+                    uuid=uuid,
+                    prepared_prefix_key=prepared_prefix_key,
+                    prepared_prefix_fingerprint_seconds=fingerprint_seconds)
         self.llm_end_dict[uuid] = True
 
         return dur_list, bnd_list, tone_list, f0_list, eng_list, pau_list
@@ -638,6 +655,7 @@ class CosyVoice3Model(CosyVoice2Model):
         dur_list, bnd_list, tone_list, f0_list, eng_list, pau_list = self.wordvoice_llm_job(text, prompt_text, llm_prompt_speech_token, llm_embedding, word_list, start_list, dur_list, bnd_list, tone_list, eng_list, f0_list, this_uuid)
         llm_seconds = time.perf_counter() - llm_started
         native_runtime_metrics = self.llm.llm.consume_native_metrics()
+        prepared_prefix_metrics = self.llm.consume_prepared_prefix_metrics()
 
         prompt_words_len = len(start_list)
         bnd_control = bnd_list[prompt_words_len:]
@@ -671,6 +689,8 @@ class CosyVoice3Model(CosyVoice2Model):
         runtime_metrics.update(self.flow_runtime_metrics)
         if native_runtime_metrics is not None:
             runtime_metrics.update(native_runtime_metrics)
+        if prepared_prefix_metrics is not None:
+            runtime_metrics.update(prepared_prefix_metrics)
         yield {'tts_speech': this_tts_speech,
                'dur_list': dur_control, 
                'bnd_list': bnd_control, 
