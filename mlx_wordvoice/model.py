@@ -144,12 +144,45 @@ def load_wordvoice_mlx(
 ) -> WordVoiceMLX:
     model_path = model_path.resolve()
     manifest = json.loads((model_path / "wordvoice.json").read_text(encoding="utf-8"))
-    if manifest.get("contract") != "wordvoice-mlx-model.v2":
+    contract = manifest.get("contract")
+    if contract != "wordvoice-mlx-model.v3":
+        if contract == "wordvoice-mlx-model.v1":
+            reason = "its non-contiguous Conv1d kernels were serialized incorrectly"
+        elif contract == "wordvoice-mlx-model.v2":
+            reason = "it omits PyTorch's fixed diffusion-noise tensor"
+        else:
+            reason = "the contract is unknown"
         raise ValueError(
-            "unsupported MLX WordVoice model contract; the v1 conversion is rejected "
-            "because non-contiguous Conv1d views were serialized with scrambled kernels"
+            f"unsupported MLX WordVoice model contract {contract!r}: {reason}"
+        )
+    noise_path = model_path / "rand_noise.npy"
+    noise_manifest = manifest.get("files", {}).get("rand_noise.npy")
+    if not isinstance(noise_manifest, dict):
+        raise ValueError("MLX WordVoice v3 manifest is missing rand_noise.npy metadata")
+    if not noise_path.is_file():
+        raise FileNotFoundError(
+            "MLX WordVoice v3 is missing PyTorch's fixed diffusion-noise tensor: "
+            f"{noise_path}"
+        )
+    actual_noise_size = noise_path.stat().st_size
+    expected_noise_size = noise_manifest.get("bytes")
+    if actual_noise_size != expected_noise_size:
+        raise ValueError(
+            "MLX WordVoice rand_noise.npy size mismatch: "
+            f"expected {expected_noise_size}, actual {actual_noise_size}"
+        )
+    noise_digest = hashlib.sha256(noise_path.read_bytes()).hexdigest()
+    expected_noise_digest = noise_manifest.get("sha256")
+    if noise_digest != expected_noise_digest:
+        raise ValueError(
+            "MLX WordVoice rand_noise.npy SHA-256 mismatch: "
+            f"expected {expected_noise_digest}, actual {noise_digest}"
         )
     base = load_cosyvoice3(str(model_path), dtype=mx.float16)
+    if base.flow.decoder._rand_noise is None:
+        raise RuntimeError(
+            "MLX CosyVoice3 did not load the required fixed diffusion-noise tensor"
+        )
     all_weights = mx.load(str(model_path / "model.safetensors"))
     llm = WordVoiceLM(llm=base.llm.llm)
     llm_weights = {

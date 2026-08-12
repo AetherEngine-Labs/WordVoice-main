@@ -5,10 +5,28 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-from mlx_wordvoice.convert import convert_flow_state, convert_llm_state
+from mlx_wordvoice.convert import (
+    PYTORCH_RAND_NOISE_SHAPE,
+    PYTORCH_RAND_NOISE_VALUES_SHA256,
+    build_pytorch_rand_noise,
+    convert_flow_state,
+    convert_llm_state,
+)
 
 
 class ConversionTest(unittest.TestCase):
+    def test_reproduces_pytorch_cfm_fixed_diffusion_noise(self):
+        import hashlib
+
+        noise = build_pytorch_rand_noise()
+
+        self.assertEqual(noise.shape, PYTORCH_RAND_NOISE_SHAPE)
+        self.assertEqual(noise.dtype, np.float32)
+        self.assertEqual(
+            hashlib.sha256(noise.tobytes()).hexdigest(),
+            PYTORCH_RAND_NOISE_VALUES_SHA256,
+        )
+
     def test_splits_wordvoice_llm_controls_from_base_weights(self):
         state = {
             "llm.model.model.layers.0.self_attn.q_proj.weight": np.zeros((2, 2)),
