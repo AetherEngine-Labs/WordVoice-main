@@ -45,7 +45,7 @@ def main() -> int:
     parser.add_argument(
         "--flow-steps",
         type=int,
-        help="Explicit Euler step count; omit to retain the model's ten-step default",
+        help="Explicit Euler step count; omit to use the approved eight-step default",
     )
     args = parser.parse_args()
     if args.flow_steps is not None and args.flow_steps < 1:

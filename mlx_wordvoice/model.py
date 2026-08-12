@@ -18,6 +18,7 @@ from .contract import PreparedRequest
 from .flow import WordVoiceFlow
 from .llm import WordVoiceLM
 from .model_manifest import validate_model_manifest
+from .runtime_options import resolve_flow_steps
 
 
 @dataclass(frozen=True)
@@ -148,11 +149,7 @@ def load_wordvoice_mlx(
     flow_steps: int | None = None,
 ) -> WordVoiceMLX:
     model_path = model_path.resolve()
-    if flow_steps is not None and flow_steps < 1:
-        raise ValueError(
-            "MLX WordVoice flow_steps must be at least 1; "
-            f"actual={flow_steps}, safe_recovery=omit-flow_steps-for-model-default"
-        )
+    resolved_flow_steps = resolve_flow_steps(flow_steps)
     validate_model_manifest(model_path)
     base = load_cosyvoice3(str(model_path), dtype=mx.float16)
     if base.flow.decoder._rand_noise is None:
@@ -196,7 +193,7 @@ def load_wordvoice_mlx(
         pre_lookahead_len=base.flow.pre_lookahead_len,
         pre_lookahead_layer=base.flow.pre_lookahead_layer,
         decoder=base.flow.decoder,
-        n_timesteps=base.flow.n_timesteps if flow_steps is None else flow_steps,
+        n_timesteps=resolved_flow_steps,
     )
     flow_weights = {
         key[5:]: value
