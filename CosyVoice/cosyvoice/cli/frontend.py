@@ -52,6 +52,10 @@ class CosyVoiceFrontEnd:
             self.spk2info = {}
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
+        if os.environ.get('COSYVOICE_DISABLE_TEXT_FRONTEND') == '1':
+            self.text_frontend = ''
+            logging.info('text frontend disabled by COSYVOICE_DISABLE_TEXT_FRONTEND')
+            return
         # NOTE compatible when no text frontend tool is avaliable
         try:
             import ttsfrd

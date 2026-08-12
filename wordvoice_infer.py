@@ -69,7 +69,7 @@ def normalize_text(text, lan='zh'):
     return text, special_dict
 
 
-def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'):
+def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh', text_frontend=True):
     """
     WordVoice 核心推理函数。
     支持零样本(Zero-shot)克隆，并允许用户通过 control_dict 显式干预生成文本的字级声学属性。
@@ -187,7 +187,8 @@ def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'
     for i, j in enumerate(wordvoice.wordvoice_inference(
             tts_text, llm_prompt, prompt_speech, 
             word_list, start_token_list, dur_list,
-            bnd_list, tone_list, eng_list, f0_list, stream=False)):
+            bnd_list, tone_list, eng_list, f0_list, stream=False,
+            text_frontend=text_frontend)):
         
         # 获取生成的音频与 LLM 最终规划/使用的声学属性
         tts_speech = j['tts_speech']
