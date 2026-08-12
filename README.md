@@ -112,6 +112,9 @@ bash download_models.sh
 
 ## 🚀 推理示例 (Inference)
 
+Apple Silicon 上的原生 MLX 转换、精确请求导出和串行资格测试流程记录在
+[`docs/mlx-native-runtime.md`](docs/mlx-native-runtime.md) 中。
+
 我们提供了一个开箱即用的推理脚本。您可以直接运行以下命令来体验 WordVoice 的**自由模式**与**控制模式**：
 
 ```bash
@@ -264,6 +267,10 @@ bash download_models.sh
 After running the `download_models.sh` script, the pre-trained model weights and dependencies (LLM backbone, Flow Matching weights, etc.) will be downloaded and saved in the `checkpoints/` folder by default. The code will load models from this path during inference or training.
 
 ## 🚀 Inference
+
+The native Apple Silicon MLX conversion, exact request export, and serial
+qualification workflow are documented in
+[`docs/mlx-native-runtime.md`](docs/mlx-native-runtime.md).
 
 We provide an out-of-the-box inference script. You can directly run the following command to experience both the **Free Mode** and **Control Mode** of WordVoice:
 

@@ -58,6 +58,14 @@ dependencies = [
     "zhon==2.1.1"
 ]
 
+[project.optional-dependencies]
+mlx = [
+    "mlx-audio-plus @ git+https://github.com/DePasqualeOrg/mlx-audio-plus.git@4c9ec6a8489e790b5ba8964ab1f1d63150476f9f",
+    "num2words==0.5.14",
+    "numpy>=1.26,<3",
+    "safetensors>=0.4,<1",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["CosyVoice*", "xxh_tools*"]  # 明确指定只打包这两个目录及其子目录
+include = ["CosyVoice*", "mlx_wordvoice*", "xxh_tools*"]  # 明确指定只打包这两个目录及其子目录

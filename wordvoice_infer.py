@@ -6,16 +6,10 @@ Attributes controlled: Duration, Energy, Pitch, Boundary, and Tone.
 """
 
 import sys
-import os
 import re
-import math
 import time
-import json
 import logging
-import tempfile
-import torch
 import torchaudio
-import torchaudio.functional as F
 
 # 动态添加依赖路径
 sys.path.append('CosyVoice/third_party/Matcha-TTS')
@@ -30,6 +24,7 @@ from zh_punc import chinese_text_normalization
 
 WORDVOICE_RUNTIME_REVISION = "starline-rtx3060-native-trt-flow-bf16-prefix-reuse-v6"
 WORDVOICE_UPSTREAM_REVISION = "98b25a64cd0cf9c80b34a1fa8c58a9bcdc786ae6"
+WORDVOICE_SOURCE_REVISION = "fe9c9b7aa13093618627de0693d7974ff0981def"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -69,7 +64,9 @@ def normalize_text(text, lan='zh'):
     return text, special_dict
 
 
-def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'):
+def eval(
+        prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh',
+        prepared_request_path=None, export_only=False):
     """
     WordVoice 核心推理函数。
     支持零样本(Zero-shot)克隆，并允许用户通过 control_dict 显式干预生成文本的字级声学属性。
@@ -181,6 +178,45 @@ def eval(prompt_text, prompt_speech, tts_text, control_dict, save_path, lan='zh'
     # ==========================================
     # 构造 LLM Prompt 格式
     llm_prompt = f'You are a helpful assistant.<|endofprompt|>{prompt_text}'
+
+    if prepared_request_path is not None:
+        from pathlib import Path
+        from mlx_wordvoice.convert import WORDVOICE_MODEL_REVISION
+        from mlx_wordvoice.export import export_prepared_request
+
+        normalized_prompt = wordvoice.frontend.text_normalize(
+            llm_prompt, split=False, text_frontend=True)
+        normalized_targets = wordvoice.frontend.text_normalize(
+            tts_text, split=False, text_frontend=True)
+        if len(normalized_targets) != 1:
+            raise ValueError(
+                'MLX prepared request export requires exactly one normalized target segment; '
+                f'actual={len(normalized_targets)}'
+            )
+        model_input = wordvoice.frontend.frontend_zero_shot_wordvoice(
+            normalized_targets[0], normalized_prompt, prompt_speech,
+            word_list, start_token_list, dur_list, bnd_list, tone_list,
+            eng_list, f0_list, wordvoice.sample_rate, '')
+        request = export_prepared_request(
+            model_input=model_input,
+            prompt_audio=Path(prompt_speech),
+            wordvoice_source_revision=WORDVOICE_SOURCE_REVISION,
+            wordvoice_model_revision=WORDVOICE_MODEL_REVISION,
+            base_model_revision='29e01c4e8d000f4bcd70751be16fa94bf3d85a18',
+            destination=Path(prepared_request_path),
+            metadata={
+                'language': lan,
+                'prompt_text': prompt_text,
+                'target_text': tts_text,
+            },
+        )
+        print(f'Prepared MLX request: {prepared_request_path}')
+        print(f'Prepared MLX request fingerprint: {request.fingerprint()}')
+        if export_only:
+            return {
+                'prepared_request_fingerprint': request.fingerprint(),
+                'prepared_request_path': str(prepared_request_path),
+            }
     
     # 调用 WordVoice 推理接口
     runtime_metrics = None
