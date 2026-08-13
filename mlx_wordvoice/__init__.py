@@ -1,4 +1,4 @@
-"""Native Apple MLX inference for the WordVoice production checkpoint."""
+"""Native Apple MLX inference for WordVoice evaluation checkpoints."""
 
 from .contract import ControlPlan, PreparedRequest
 

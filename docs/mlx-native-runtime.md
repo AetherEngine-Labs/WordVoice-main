@@ -97,20 +97,22 @@ RMS floors. Production admission still requires a representative listening
 test; successful token/control and activity gates are not voice-quality
 approval.
 
-Eight Euler flow steps are the production default approved by Alexander after
-listening to the representative 27.28-second audition on 2026-08-13. On its
-fixed PyTorch token/control plan, eight steps reduced same-process flow time by
-25.4% and retained a ten-step mel cosine of 0.999929. Whisper tiny.en produced
-the same relative WER for both samples. Omit `--flow-steps` for the approved
-eight-step production profile; use explicit `--flow-steps 10` only when the
-ten-step quality-reference profile is required for comparison or diagnosis.
+Eight Euler flow steps remain the evaluation default. On a fixed PyTorch
+token/control plan, eight steps reduced same-process flow time by 25.4% and
+retained a ten-step mel cosine of 0.999929. This comparison proved acoustic
+parity between step counts, not natural speech. On 2026-08-13 Alexander
+rejected both the FP16 eight-step audition and the selective-Qwen audition as
+weird. The 108-word target had been compressed into about 27 seconds and its
+stored ASR check contained unrelated fragments at the ending. No native MLX
+WordVoice profile is production-approved. Omit `--flow-steps` only for
+evaluation; use explicit `--flow-steps 10` for comparison or diagnosis.
 
 ## Build an explicit selective-Qwen candidate
 
 The autoregressive Qwen transformer can be quantized without changing the
 full-precision WordVoice controls, flow decoder, or vocoder. The converter
 accepts only an admitted v3 package and writes a new immutable v4 destination;
-it never modifies or replaces the approved FP16 production model.
+it never modifies or replaces the FP16 evaluation model.
 
 ```bash
 AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-quantize \
