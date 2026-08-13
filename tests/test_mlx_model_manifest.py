@@ -30,6 +30,40 @@ class ModelManifestTest(unittest.TestCase):
 
             self.assertEqual(validate_model_manifest(root), expected)
 
+    def test_accepts_selective_qwen_v4_package(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected = self.create_model(root, contract="wordvoice-mlx-model.v4")
+            expected["quantization"] = {
+                "bits": 4,
+                "components": ["qwen2.model.layers"],
+                "group_size": 64,
+                "mode": "affine",
+            }
+            (root / "wordvoice.json").write_text(
+                json.dumps(expected), encoding="utf-8"
+            )
+
+            self.assertEqual(validate_model_manifest(root), expected)
+
+    def test_rejects_broader_or_unknown_v4_quantization(self):
+        invalid = (
+            {"bits": 3, "components": ["qwen2.model.layers"], "group_size": 64},
+            {"bits": 4, "components": ["flow"], "group_size": 64},
+            {"bits": 4, "components": ["qwen2.model.layers"], "group_size": 32},
+        )
+        for quantization in invalid:
+            with self.subTest(quantization=quantization), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest = self.create_model(root, contract="wordvoice-mlx-model.v4")
+                manifest["quantization"] = quantization
+                (root / "wordvoice.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+
+                with self.assertRaisesRegex(ValueError, "quantization contract mismatch"):
+                    validate_model_manifest(root)
+
     def test_rejects_superseded_contracts(self):
         for contract in ("wordvoice-mlx-model.v1", "wordvoice-mlx-model.v2"):
             with self.subTest(contract=contract), TemporaryDirectory() as temporary:

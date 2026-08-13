@@ -104,3 +104,24 @@ fixed PyTorch token/control plan, eight steps reduced same-process flow time by
 the same relative WER for both samples. Omit `--flow-steps` for the approved
 eight-step production profile; use explicit `--flow-steps 10` only when the
 ten-step quality-reference profile is required for comparison or diagnosis.
+
+## Build an explicit selective-Qwen candidate
+
+The autoregressive Qwen transformer can be quantized without changing the
+full-precision WordVoice controls, flow decoder, or vocoder. The converter
+accepts only an admitted v3 package and writes a new immutable v4 destination;
+it never modifies or replaces the approved FP16 production model.
+
+```bash
+AGENT_OWNER=operator AGENT_TASK=wordvoice-mlx-quantize \
+~/.ainotebook/wordvoice-mlx-venv/bin/python \
+  -X agent.owner=operator -X agent.task=wordvoice-mlx-quantize \
+  -m mlx_wordvoice.convert \
+  --source-model /absolute/path/to/wordvoice-mlx-fp16-v3 \
+  --qwen-bits 4 \
+  --destination /absolute/path/to/wordvoice-mlx-qwen4-v4
+```
+
+Four- and eight-bit candidates are evaluation models until their sequential
+benchmark receipts and representative audio receive explicit listening
+approval. Quantization is never an automatic fallback from the FP16 runtime.

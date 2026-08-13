@@ -8,13 +8,15 @@ from pathlib import Path
 
 
 MODEL_CONTRACT = "wordvoice-mlx-model.v3"
+QUANTIZED_MODEL_CONTRACT = "wordvoice-mlx-model.v4"
+SUPPORTED_MODEL_CONTRACTS = {MODEL_CONTRACT, QUANTIZED_MODEL_CONTRACT}
 
 
 def validate_model_manifest(model_path: Path) -> dict[str, object]:
     manifest_path = model_path / "wordvoice.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     contract = manifest.get("contract")
-    if contract != MODEL_CONTRACT:
+    if contract not in SUPPORTED_MODEL_CONTRACTS:
         if contract == "wordvoice-mlx-model.v1":
             reason = "its non-contiguous Conv1d kernels were serialized incorrectly"
         elif contract == "wordvoice-mlx-model.v2":
@@ -25,6 +27,26 @@ def validate_model_manifest(model_path: Path) -> dict[str, object]:
             f"unsupported MLX WordVoice model contract {contract!r}: {reason}; "
             "safe_recovery=reconvert-with-wordvoice-mlx-model.v3"
         )
+
+    if contract == QUANTIZED_MODEL_CONTRACT:
+        quantization = manifest.get("quantization")
+        if not isinstance(quantization, dict):
+            raise ValueError(
+                "MLX WordVoice v4 manifest is missing quantization metadata; "
+                "safe_recovery=rebuild-from-an-admitted-v3-model"
+            )
+        bits = quantization.get("bits")
+        group_size = quantization.get("group_size")
+        components = quantization.get("components")
+        if bits not in {4, 8} or group_size != 64 or components != [
+            "qwen2.model.layers"
+        ]:
+            raise ValueError(
+                "MLX WordVoice v4 quantization contract mismatch: "
+                f"bits={bits!r}, group_size={group_size!r}, "
+                f"components={components!r}; "
+                "safe_recovery=rebuild-with-selective-qwen-quantization"
+            )
 
     files = manifest.get("files")
     noise_manifest = files.get("rand_noise.npy") if isinstance(files, dict) else None

@@ -169,6 +169,175 @@ def _verify_file(path: Path, expected_sha256: str, role: str) -> None:
         )
 
 
+def _quantize_qwen_weights(
+    weights: Mapping[str, object], *, bits: int, group_size: int
+) -> dict[str, object]:
+    """Quantize only Qwen transformer Linear layers for faster autoregression."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.qwen2 import Model as Qwen2Model
+    from mlx_lm.models.qwen2 import ModelArgs
+
+    if bits not in {4, 8}:
+        raise ValueError(f"Qwen quantization bits must be 4 or 8, actual={bits}")
+    if group_size != 64:
+        raise ValueError(
+            f"Qwen quantization group size must be 64, actual={group_size}"
+        )
+    model = Qwen2Model(
+        ModelArgs(
+            model_type="qwen2",
+            hidden_size=896,
+            intermediate_size=4864,
+            num_attention_heads=14,
+            num_hidden_layers=24,
+            num_key_value_heads=2,
+            vocab_size=151936,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            tie_word_embeddings=True,
+        )
+    )
+    source = {
+        key[len("qwen2.") :]: value
+        for key, value in weights.items()
+        if key.startswith("qwen2.") and key != "qwen2.lm_head.weight"
+    }
+    model.load_weights(list(source.items()))
+    mx.eval(model.parameters())
+
+    def should_quantize(path, module):
+        return isinstance(module, nn.Linear) and "model.layers" in path
+
+    nn.quantize(
+        model,
+        bits=bits,
+        group_size=group_size,
+        class_predicate=should_quantize,
+    )
+    mx.eval(model.parameters())
+    return {
+        "qwen2." + key: value for key, value in tree_flatten(model.parameters())
+    }
+
+
+def quantize_existing_model(
+    *,
+    source_model: Path,
+    destination: Path,
+    bits: int,
+    group_size: int = 64,
+) -> dict[str, object]:
+    """Create an immutable selective-Qwen candidate from an admitted v3 model."""
+    import mlx.core as mx
+
+    from .model_manifest import MODEL_CONTRACT, validate_model_manifest
+
+    source_model = source_model.resolve()
+    destination = destination.resolve()
+    if destination.exists():
+        raise FileExistsError(f"destination already exists: {destination}")
+    source_manifest = validate_model_manifest(source_model)
+    if source_manifest.get("contract") != MODEL_CONTRACT:
+        raise ValueError(
+            "selective Qwen quantization requires an admitted FP16 v3 source; "
+            f"actual={source_manifest.get('contract')!r}"
+        )
+    source_weights_path = source_model / "model.safetensors"
+    source_files = source_manifest.get("files")
+    source_weights_manifest = (
+        source_files.get("model.safetensors")
+        if isinstance(source_files, dict)
+        else None
+    )
+    if not isinstance(source_weights_manifest, dict):
+        raise ValueError("source v3 manifest is missing model.safetensors metadata")
+    _verify_file(
+        source_weights_path,
+        str(source_weights_manifest.get("sha256")),
+        "source MLX WordVoice model",
+    )
+
+    weights = mx.load(str(source_weights_path))
+    quantized_qwen = _quantize_qwen_weights(
+        weights, bits=bits, group_size=group_size
+    )
+    retained = {
+        key: value for key, value in weights.items() if not key.startswith("qwen2.")
+    }
+    candidate = {**retained, **quantized_qwen}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent)
+    )
+    try:
+        model_path = temporary / "model.safetensors"
+        mx.save_safetensors(
+            str(model_path),
+            candidate,
+            metadata={
+                "format": "wordvoice-mlx-selective-qwen-v4",
+                "qwen_bits": str(bits),
+                "qwen_group_size": str(group_size),
+                "source_model_sha256": str(source_weights_manifest["sha256"]),
+            },
+        )
+        for source in source_model.iterdir():
+            if source.name in {"model.safetensors", "wordvoice.json"} or not source.is_file():
+                continue
+            shutil.copy2(source, temporary / source.name)
+        config_path = temporary / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["quantization"] = {
+            "bits": bits,
+            "group_size": group_size,
+            "quantized_components": ["qwen2.model.layers"],
+        }
+        config_path.write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        noise_path = temporary / "rand_noise.npy"
+        manifest = {
+            "contract": "wordvoice-mlx-model.v4",
+            "dtypes": {
+                "qwen2_transformer_linear_weights": f"{bits}-bit-affine",
+                "remaining_weights": "float16",
+                "rand_noise": "float32",
+            },
+            "files": {
+                "model.safetensors": {
+                    "bytes": model_path.stat().st_size,
+                    "sha256": sha256_file(model_path),
+                },
+                "rand_noise.npy": {
+                    "bytes": noise_path.stat().st_size,
+                    "sha256": sha256_file(noise_path),
+                },
+            },
+            "inputs": source_manifest.get("inputs"),
+            "parent": {
+                "contract": MODEL_CONTRACT,
+                "model_sha256": source_weights_manifest["sha256"],
+            },
+            "quantization": {
+                "bits": bits,
+                "components": ["qwen2.model.layers"],
+                "group_size": group_size,
+                "mode": "affine",
+            },
+            "tensor_count": len(candidate),
+        }
+        (temporary / "wordvoice.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, destination)
+        return manifest
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
 def convert(
     *,
     base_model: Path,
@@ -290,17 +459,54 @@ def convert(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-model", type=Path, required=True)
-    parser.add_argument("--llm-checkpoint", type=Path, required=True)
-    parser.add_argument("--flow-checkpoint", type=Path, required=True)
+    parser.add_argument("--base-model", type=Path)
+    parser.add_argument("--llm-checkpoint", type=Path)
+    parser.add_argument("--flow-checkpoint", type=Path)
+    parser.add_argument(
+        "--source-model",
+        type=Path,
+        help="Admitted FP16 v3 model to selectively quantize",
+    )
+    parser.add_argument("--qwen-bits", type=int, choices=(4, 8))
+    parser.add_argument("--qwen-group-size", type=int, default=64)
     parser.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args()
-    manifest = convert(
-        base_model=args.base_model,
-        llm_checkpoint=args.llm_checkpoint,
-        flow_checkpoint=args.flow_checkpoint,
-        destination=args.destination,
-    )
+    if args.source_model is not None:
+        if any(
+            value is not None
+            for value in (args.base_model, args.llm_checkpoint, args.flow_checkpoint)
+        ):
+            parser.error(
+                "--source-model cannot be combined with source checkpoint arguments"
+            )
+        if args.qwen_bits is None:
+            parser.error("--source-model requires --qwen-bits")
+        manifest = quantize_existing_model(
+            source_model=args.source_model,
+            destination=args.destination,
+            bits=args.qwen_bits,
+            group_size=args.qwen_group_size,
+        )
+    else:
+        missing = [
+            name
+            for name, value in (
+                ("--base-model", args.base_model),
+                ("--llm-checkpoint", args.llm_checkpoint),
+                ("--flow-checkpoint", args.flow_checkpoint),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(f"source checkpoint conversion requires {', '.join(missing)}")
+        if args.qwen_bits is not None:
+            parser.error("--qwen-bits requires --source-model")
+        manifest = convert(
+            base_model=args.base_model,
+            llm_checkpoint=args.llm_checkpoint,
+            flow_checkpoint=args.flow_checkpoint,
+            destination=args.destination,
+        )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0
 
