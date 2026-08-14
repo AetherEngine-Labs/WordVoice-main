@@ -187,9 +187,12 @@ class CosyVoice2(CosyVoice):
 
 
 class WordVoice(CosyVoice2):
-    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, llm_trt_runtime=None, flow_amp_dtype=None):
+    def __init__(self, model_dir, llm_path=None, flow_path=None, hyper_yaml_path=None, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, llm_trt_runtime=None, flow_amp_dtype=None, flow_steps=10):
+        if not isinstance(flow_steps, int) or isinstance(flow_steps, bool) or flow_steps < 1:
+            raise ValueError('WordVoice flow_steps must be a positive integer')
         self.model_dir = model_dir
         self.fp16 = fp16
+        self.flow_steps = flow_steps
         if not os.path.exists(model_dir):
             model_dir = snapshot_download(model_dir)
         if hyper_yaml_path is None:
@@ -236,6 +239,8 @@ class WordVoice(CosyVoice2):
                                 self.fp16)
         if flow_amp_dtype is not None:
             self.model.enable_wordvoice_flow_amp(flow_amp_dtype)
+        self.model.flow.n_timesteps = self.flow_steps
+        self.model.flow_runtime_metrics['flow_steps'] = self.flow_steps
         del configs
 
     def wordvoice_inference(

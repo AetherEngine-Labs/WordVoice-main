@@ -785,7 +785,7 @@ class CausalMaskedDiffWithDiT_WV(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=getattr(self, 'n_timesteps', 10),
             streaming=streaming
         )
         if token.is_cuda:
