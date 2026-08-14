@@ -94,6 +94,9 @@ hift: !new:cosyvoice.hifigan.generator.CausalHiFTGenerator
     lrelu_slope: 0.1
     audio_limit: 0.99
     conv_pre_look_right: 4
+    # Windows production default: keep the complete renderer on the RTX path.
+    # CPU is an explicit diagnostic override, not an automatic fallback.
+    f0_predictor_device: cuda
     f0_predictor: !new:cosyvoice.hifigan.f0_predictor.CausalConvRNNF0Predictor
         num_class: 1
         in_channels: 80

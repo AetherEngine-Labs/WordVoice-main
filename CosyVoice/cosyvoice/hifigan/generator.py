@@ -594,6 +594,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             audio_limit: float = 0.99,
             conv_pre_look_right: int = 4,
             f0_predictor: torch.nn.Module = None,
+            f0_predictor_device: str = 'auto',
     ):
         torch.nn.Module.__init__(self)
 
@@ -668,6 +669,24 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
+        if f0_predictor_device not in ('auto', 'cpu', 'cuda'):
+            raise ValueError('f0_predictor_device must be auto, cpu, or cuda')
+        self.f0_predictor_device = f0_predictor_device
+        self._f0_predictor_ready = False
+
+    def _prepare_f0_predictor(self, speech_feat: torch.Tensor) -> torch.device:
+        if self.f0_predictor_device == 'auto':
+            device = speech_feat.device
+        else:
+            device = torch.device(self.f0_predictor_device)
+        if device.type == 'cuda' and device.index is None:
+            device = speech_feat.device
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError('f0_predictor_device=cuda requires CUDA')
+        if not self._f0_predictor_ready:
+            self.f0_predictor.to(device=device, dtype=torch.float64)
+            self._f0_predictor_ready = True
+        return device
 
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
@@ -713,8 +732,11 @@ class CausalHiFTGenerator(HiFTGenerator):
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move self.f0_predictor to cpu if necessary
-        self.f0_predictor.to(torch.float64)
-        f0 = self.f0_predictor(speech_feat.to(torch.float64), finalize=finalize).to(speech_feat)
+        f0_device = self._prepare_f0_predictor(speech_feat)
+        f0 = self.f0_predictor(
+            speech_feat.to(device=f0_device, dtype=torch.float64),
+            finalize=finalize,
+        ).to(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)

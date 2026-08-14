@@ -587,6 +587,7 @@ class CosyVoice3Model(CosyVoice2Model):
             'flow_seconds': round(flow_seconds, 3),
             'flow_sequence_frames': int((token.shape[1] + prompt_token.shape[1]) * self.flow.token_mel_ratio),
             'vocoder_seconds': round(vocoder_seconds, 3),
+            'f0_predictor_device': self.hift.f0_predictor_device,
         }
         stage_metrics.update(flow_detail_metrics)
         return tts_speech, stage_metrics
