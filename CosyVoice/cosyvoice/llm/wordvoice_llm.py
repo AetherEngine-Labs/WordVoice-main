@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
+import json
 import os, queue
 import random
 import time
@@ -569,6 +570,20 @@ class Qwen2LM(TransformerLM):
             embedding: torch.Tensor,
     ) -> str:
         digest = hashlib.sha256()
+        native_decoder = getattr(self.llm, 'native_decoder', None)
+        decoder_manifest = getattr(native_decoder, 'manifest', None)
+        decoder_identity = {
+            'decoder_class': (
+                type(native_decoder).__name__ if native_decoder is not None else 'eager'
+            ),
+            'manifest': decoder_manifest if isinstance(decoder_manifest, dict) else {},
+            'sampling': self.sampling,
+            'model_class': type(self.llm.model).__name__,
+        }
+        digest.update(
+            b'prepared-prefix-runtime-identity:'
+            + json.dumps(decoder_identity, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        )
         for name, tensor in (
                 ('text', text),
                 ('prompt_text', prompt_text),

@@ -1,6 +1,7 @@
 import importlib
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import torch
@@ -106,6 +107,30 @@ class PreparedPrefixTest(unittest.TestCase):
             args["word_list"], args["start_list"], args["dur_list"],
             args["bnd_list"], args["tone_list"], args["eng_list"],
             args["f0_list"], changed_embedding,
+        )
+        self.assertNotEqual(first, second)
+
+    def test_fingerprint_changes_with_decoder_identity(self):
+        self.decoder.native_decoder = SimpleNamespace(
+            manifest={
+                "engine_sha256": "engine-a",
+                "wordvoice_llm_sha256": "weights-a",
+                "precision": "fp32",
+            }
+        )
+        args = self.inputs
+        first = self.model.prepared_prefix_key(
+            args["text"], args["prompt_text"], args["prompt_speech_token"],
+            args["word_list"], args["start_list"], args["dur_list"],
+            args["bnd_list"], args["tone_list"], args["eng_list"],
+            args["f0_list"], args["embedding"],
+        )
+        self.decoder.native_decoder.manifest["engine_sha256"] = "engine-b"
+        second = self.model.prepared_prefix_key(
+            args["text"], args["prompt_text"], args["prompt_speech_token"],
+            args["word_list"], args["start_list"], args["dur_list"],
+            args["bnd_list"], args["tone_list"], args["eng_list"],
+            args["f0_list"], args["embedding"],
         )
         self.assertNotEqual(first, second)
 

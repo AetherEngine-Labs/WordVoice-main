@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ class WordVoiceTensorRTDecoder:
 
         self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._stream = torch.cuda.Stream()
+        self._execution_lock = threading.Lock()
         self._host_seconds = 0.0
         self._steps = 0
         self._validated_mask_address: int | None = None
@@ -275,6 +277,13 @@ class WordVoiceTensorRTDecoder:
     def forward_one_step(
         self, inputs_embeds: torch.Tensor, masks: torch.Tensor, cache: Any
     ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
+        """Run the single shared TensorRT context without overlapping calls."""
+        with self._execution_lock:
+            return self._forward_one_step(inputs_embeds, masks, cache)
+
+    def _forward_one_step(
+        self, inputs_embeds: torch.Tensor, masks: torch.Tensor, cache: Any
+    ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
         started = time.perf_counter()
         legacy_cache = (
             cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
@@ -341,10 +350,10 @@ class WordVoiceTensorRTDecoder:
                         f"expected={past_tokens}; actual={shape[2]}; layer={layer}"
                     )
                 cache_inputs.append(tensor.to(dtype=self.dtype).contiguous())
-        if past_tokens is None or not 1 <= past_tokens < self.max_past_tokens:
+        if past_tokens is None or not 1 <= past_tokens <= self.max_past_tokens:
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=cache-length; "
-                f"expected=1..{self.max_past_tokens - 1}; actual={past_tokens}"
+                f"expected=1..{self.max_past_tokens}; actual={past_tokens}"
             )
 
         if not self.context.set_input_shape("inputs_embeds", tuple(inputs.shape)):
