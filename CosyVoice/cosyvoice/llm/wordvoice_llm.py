@@ -577,7 +577,10 @@ class Qwen2LM(TransformerLM):
                 type(native_decoder).__name__ if native_decoder is not None else 'eager'
             ),
             'manifest': decoder_manifest if isinstance(decoder_manifest, dict) else {},
-            'sampling': self.sampling,
+            'sampling': (
+                getattr(self.sampling, '__module__', type(self.sampling).__module__),
+                getattr(self.sampling, '__qualname__', type(self.sampling).__qualname__),
+            ),
             'model_class': type(self.llm.model).__name__,
         }
         digest.update(
