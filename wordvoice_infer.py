@@ -28,7 +28,7 @@ from get_dsp import extract_words_dsp
 from en_punc import english_text_normalization
 from zh_punc import chinese_text_normalization
 
-WORDVOICE_RUNTIME_REVISION = "starline-rtx3060-native-trt-flow-bf16-prefix-reuse-v13-hotloop"
+WORDVOICE_RUNTIME_REVISION = "starline-rtx3060-native-trt-flow-bf16-prefix-reuse-v14-static-prefill"
 WORDVOICE_UPSTREAM_REVISION = "98b25a64cd0cf9c80b34a1fa8c58a9bcdc786ae6"
 
 logging.basicConfig(level=logging.INFO)
