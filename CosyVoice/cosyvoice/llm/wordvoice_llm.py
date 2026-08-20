@@ -656,25 +656,28 @@ class Qwen2LM(TransformerLM):
             prepare_started = time.perf_counter()
             text_emb = self.llm.model.model.embed_tokens(text)
             style_embs = []
-            word_embs_list = []
+            if word_list:
+                first_word_tokens = torch.cat(
+                    [word[:, :1] for word in word_list], dim=1
+                ).to(device)
+                word_embs_list = list(
+                    self.llm.model.model.embed_tokens(first_word_tokens)[0].unbind(dim=0)
+                )
+            else:
+                word_embs_list = []
             prompt_word_count = len(start_list)
             for i in range(len(word_list)):
-                w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
-                word_embs_list.append(w_emb)
+                w_emb = word_embs_list[i]
                 if i >= prompt_word_count:
                     continue
-                d = torch.clamp(
-                    torch.tensor([dur_list[i]], device=device, dtype=torch.long),
-                    0,
-                    self.max_duration - 1,
-                )
+                d = min(max(int(dur_list[i]), 0), self.max_duration - 1)
                 b = bnd_list[i]
                 t = tone_list[i]
                 e = eng_list[i]
                 f = f0_list[i]
                 style_embs.append(torch.stack([
                     w_emb,
-                    self.duration_embedding.weight[int(d.item())],
+                    self.duration_embedding.weight[d],
                     self.boundary_embedding.weight[int(b)],
                     self.tone_embedding.weight[int(t)],
                     self.f0_embedding.weight[int(f)],
