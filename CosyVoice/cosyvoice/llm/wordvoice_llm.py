@@ -18,6 +18,7 @@ import os, queue
 import random
 import time
 import threading
+from functools import wraps
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List, Generator
 import numpy as np
@@ -75,6 +76,33 @@ def _tensor_bytes(value) -> int:
         return sum(_tensor_bytes(item) for item in value)
     return 0
 
+
+def _on_dedicated_cuda_stream(function):
+    """Run one complete WordVoice LLM call on a non-default CUDA stream."""
+
+    @wraps(function)
+    def wrapper(self, *args, **kwargs):
+        text = kwargs.get("text")
+        if text is None and args:
+            text = args[0]
+        if not isinstance(text, torch.Tensor) or not text.is_cuda:
+            return function(self, *args, **kwargs)
+
+        caller_stream = torch.cuda.current_stream(text.device)
+        decode_stream = getattr(self, "_wordvoice_decode_stream", None)
+        if decode_stream is None or decode_stream.device != text.device:
+            decode_stream = torch.cuda.Stream(device=text.device)
+            self._wordvoice_decode_stream = decode_stream
+
+        decode_stream.wait_stream(caller_stream)
+        try:
+            with torch.cuda.stream(decode_stream):
+                return function(self, *args, **kwargs)
+        finally:
+            caller_stream.wait_stream(decode_stream)
+
+    return wrapper
+
 class TransformerLM(torch.nn.Module):
     def __init__(
             self,
@@ -107,6 +135,7 @@ class TransformerLM(torch.nn.Module):
         self.eos_token = self.speech_token_size
         self.llm_embedding = torch.nn.Embedding(2, llm_input_size)
         self.llm = llm
+        self._wordvoice_decode_stream = None
         self.llm_decoder = nn.Linear(llm_output_size, speech_token_size + 1)
         self.criterion_ce = LabelSmoothingLoss(
             size=speech_token_size + 1,
@@ -613,6 +642,7 @@ class Qwen2LM(TransformerLM):
         self._prepared_prefix_metrics = None
         return metrics
 
+    @_on_dedicated_cuda_stream
     @torch.inference_mode()
     def base_inference(
             self,
@@ -731,8 +761,6 @@ class Qwen2LM(TransformerLM):
                 masks=prefill_mask,
                 cache=None,
             )
-            if hidden.is_cuda:
-                torch.cuda.current_stream(hidden.device).synchronize()
             immutable_cache = _cache_tuple(cache)
             prepare_seconds = time.perf_counter() - prepare_started
             last_hidden = hidden[:, -1:, :].clone()
