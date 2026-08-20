@@ -506,8 +506,6 @@ class WordVoiceTensorRTDecoder:
         return hidden
 
     def _prepare_inputs(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        if inputs_embeds.dtype == self.dtype and inputs_embeds.is_contiguous():
-            return inputs_embeds
         if self._input_buffer is None:
             self._input_buffer = torch.empty(
                 tuple(inputs_embeds.shape),
@@ -526,6 +524,11 @@ class WordVoiceTensorRTDecoder:
                 f"actual={self._input_buffer.device}/{self._input_buffer.dtype}/"
                 f"{tuple(self._input_buffer.shape)}"
             )
+        if self._input_buffer.data_ptr() == inputs_embeds.data_ptr():
+            return self._input_buffer
+        # Keep one stable TensorRT input address. WordVoice normally supplies a
+        # view into a different embedding row on every token, so returning that
+        # view would force an address rebinding on every decode step.
         self._input_buffer.copy_(inputs_embeds)
         return self._input_buffer
 

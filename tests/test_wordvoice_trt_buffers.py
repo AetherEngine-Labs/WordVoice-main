@@ -136,6 +136,22 @@ class WordVoiceTensorRTBufferTest(unittest.TestCase):
         self.assertEqual(decoder._input_buffer_allocations, 1)
         self.assertTrue(torch.equal(second, torch.full_like(second, 2.0)))
 
+    def test_input_staging_buffer_stabilizes_same_dtype_address(self):
+        decoder = object.__new__(WordVoiceTensorRTDecoder)
+        decoder.dtype = torch.float32
+        decoder._input_buffer = None
+        decoder._input_buffer_allocations = 0
+        first_source = torch.ones((1, 1, 8), dtype=torch.float32)
+        second_source = torch.full((1, 1, 8), 2.0, dtype=torch.float32)
+
+        first = decoder._prepare_inputs(first_source)
+        second = decoder._prepare_inputs(second_source)
+
+        self.assertIs(first, second)
+        self.assertNotEqual(first.data_ptr(), first_source.data_ptr())
+        self.assertEqual(decoder._input_buffer_allocations, 1)
+        self.assertTrue(torch.equal(second, second_source))
+
     def test_cache_slots_are_reused_and_identifiable(self):
         decoder = object.__new__(WordVoiceTensorRTDecoder)
         decoder.num_kv_heads = 2
