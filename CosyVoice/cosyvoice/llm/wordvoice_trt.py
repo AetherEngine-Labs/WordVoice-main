@@ -482,7 +482,8 @@ class WordVoiceTensorRTDecoder:
         if context_state.last_cache_shape != cache_shape:
             # Cache length changes only when a new token is appended. Repeated
             # lengths (for example across lines) do not need another shape
-            # negotiation; tensor addresses are still refreshed every step.
+            # negotiation; cache addresses are rebound only when their source
+            # slot or eager-cache pointer changes.
             index = 0
             for layer in range(self.num_layers):
                 for kind in ("key", "value"):
