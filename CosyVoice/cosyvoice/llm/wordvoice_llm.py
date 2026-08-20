@@ -731,8 +731,6 @@ class Qwen2LM(TransformerLM):
                 masks=prefill_mask,
                 cache=None,
             )
-            if hidden.is_cuda:
-                torch.cuda.current_stream(hidden.device).synchronize()
             immutable_cache = _cache_tuple(cache)
             prepare_seconds = time.perf_counter() - prepare_started
             last_hidden = hidden[:, -1:, :].clone()
