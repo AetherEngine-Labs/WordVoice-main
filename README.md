@@ -272,6 +272,14 @@ python wordvoice_infer.py
 ```
 You can modify the input text, reference audio path, and manually specify word-level control parameters (e.g., duration or pitch of certain words) in `wordvoice_infer.py`. We also provide default inference samples within the script.
 
+### Production runtime
+
+Production workloads use the native TensorRT decoder profile documented in
+[`docs/optimized-runtime.md`](docs/optimized-runtime.md). The eager PyTorch
+decoder is not an automatic fallback: a missing or mismatched optimized engine
+must fail closed. For multi-speaker work, generate each speaker's lines while
+its caches remain resident, then restore the original script order.
+
 ---
 
 ## 🏋️ Training
