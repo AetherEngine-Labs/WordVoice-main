@@ -138,7 +138,9 @@ class WordVoiceTensorRTDecoder:
                 f"expected={sorted(expected_names)}; actual={sorted(actual_names)}"
             )
 
-        self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._timing_start = torch.cuda.Event(enable_timing=True)
+        self._timing_end = torch.cuda.Event(enable_timing=True)
+        self._device_seconds = 0.0
         self._execution_lock = threading.Lock()
         self._host_seconds = 0.0
         self._steps = 0
@@ -430,34 +432,30 @@ class WordVoiceTensorRTDecoder:
         self._validated_output_shapes = True
 
         current_stream = torch.cuda.current_stream(inputs.device)
-        event_start = torch.cuda.Event(enable_timing=True)
-        event_end = torch.cuda.Event(enable_timing=True)
-        event_start.record(current_stream)
+        self._timing_start.record(current_stream)
         if not self.context.execute_async_v3(current_stream.cuda_stream):
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=execute; "
                 f"engine={self.engine_path}; past_tokens={past_tokens}"
             )
-        event_end.record(current_stream)
-        self._events.append((event_start, event_end))
+        self._timing_end.record(current_stream)
+        self._timing_end.synchronize()
+        self._device_seconds += (
+            self._timing_start.elapsed_time(self._timing_end) / 1000.0
+        )
         self._host_seconds += time.perf_counter() - started
         self._steps += 1
         return hidden, tuple(present)
 
     def reset_metrics(self) -> None:
-        self._events.clear()
+        self._device_seconds = 0.0
         self._host_seconds = 0.0
         self._steps = 0
 
     def consume_metrics(self) -> dict[str, Any]:
-        if self._events:
-            self._events[-1][1].synchronize()
-        device_seconds = sum(
-            start.elapsed_time(end) / 1000.0 for start, end in self._events
-        )
         metrics: dict[str, Any] = {
             "decoder_backend": "tensorrt",
-            "native_decode_seconds": round(device_seconds, 3),
+            "native_decode_seconds": round(self._device_seconds, 3),
             "native_host_seconds": round(self._host_seconds, 3),
             "native_transfer_seconds": 0.0,
             "native_decode_steps": self._steps,
