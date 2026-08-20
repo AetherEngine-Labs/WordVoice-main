@@ -662,25 +662,28 @@ class Qwen2LM(TransformerLM):
             text_emb = self.llm.model.model.embed_tokens(text)
             style_embs = []
             word_embs_list = []
+            prompt_word_count = len(start_list)
             for i in range(len(word_list)):
                 w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
                 word_embs_list.append(w_emb)
+                if i >= prompt_word_count:
+                    continue
                 d = torch.clamp(
                     torch.tensor([dur_list[i]], device=device, dtype=torch.long),
                     0,
                     self.max_duration - 1,
                 )
-                b = torch.tensor([bnd_list[i]], device=device, dtype=torch.long)
-                t = torch.tensor([tone_list[i]], device=device, dtype=torch.long)
-                e = torch.tensor([eng_list[i]], device=device, dtype=torch.long)
-                f = torch.tensor([f0_list[i]], device=device, dtype=torch.long)
+                b = bnd_list[i]
+                t = tone_list[i]
+                e = eng_list[i]
+                f = f0_list[i]
                 style_embs.append(torch.stack([
                     w_emb,
-                    self.duration_embedding(d).view(-1),
-                    self.boundary_embedding(b).view(-1),
-                    self.tone_embedding(t).view(-1),
-                    self.f0_embedding(f).view(-1),
-                    self.energy_embedding(e).view(-1),
+                    self.duration_embedding.weight[int(d.item())],
+                    self.boundary_embedding.weight[int(b)],
+                    self.tone_embedding.weight[int(t)],
+                    self.f0_embedding.weight[int(f)],
+                    self.energy_embedding.weight[int(e)],
                 ], dim=0).mean(dim=0).view(1, 1, -1))
 
             word_idx = 0
