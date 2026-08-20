@@ -144,6 +144,8 @@ class WordVoiceTensorRTDecoder:
         self._execution_lock = threading.Lock()
         self._host_seconds = 0.0
         self._steps = 0
+        self._timing_stream: torch.cuda.Stream | None = None
+        self._timing_active = False
         self._validated_mask_address: int | None = None
         self._parity: dict[str, float] | None = None
         self._fixed_input_shapes_set = False
@@ -432,17 +434,20 @@ class WordVoiceTensorRTDecoder:
         self._validated_output_shapes = True
 
         current_stream = torch.cuda.current_stream(inputs.device)
-        self._timing_start.record(current_stream)
+        if not self._timing_active:
+            self._timing_stream = current_stream
+            self._timing_start.record(current_stream)
+            self._timing_active = True
+        elif self._timing_stream is not current_stream:
+            raise RuntimeError(
+                "WordVoice TensorRT gate failed; stage=timing-stream; "
+                "all decoder steps for one synthesis call must use one CUDA stream"
+            )
         if not self.context.execute_async_v3(current_stream.cuda_stream):
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=execute; "
                 f"engine={self.engine_path}; past_tokens={past_tokens}"
             )
-        self._timing_end.record(current_stream)
-        self._timing_end.synchronize()
-        self._device_seconds += (
-            self._timing_start.elapsed_time(self._timing_end) / 1000.0
-        )
         self._host_seconds += time.perf_counter() - started
         self._steps += 1
         return hidden, tuple(present)
@@ -451,8 +456,17 @@ class WordVoiceTensorRTDecoder:
         self._device_seconds = 0.0
         self._host_seconds = 0.0
         self._steps = 0
+        self._timing_stream = None
+        self._timing_active = False
 
     def consume_metrics(self) -> dict[str, Any]:
+        if self._timing_active:
+            assert self._timing_stream is not None
+            self._timing_end.record(self._timing_stream)
+            self._timing_end.synchronize()
+            self._device_seconds = (
+                self._timing_start.elapsed_time(self._timing_end) / 1000.0
+            )
         metrics: dict[str, Any] = {
             "decoder_backend": "tensorrt",
             "native_decode_seconds": round(self._device_seconds, 3),
