@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,16 @@ def _flat_cache_view(
             f"expected=contiguous; actual_strides={view.stride()}"
         )
     return view
+
+
+@dataclass
+class _ExecutionContextState:
+    context: Any
+    fixed_input_shapes_set: bool = False
+    last_cache_shape: tuple[int, ...] | None = None
+    validated_output_shapes: bool = False
+    bound_input_cache_key: tuple[str, int] | None = None
+    output_addresses_bound: bool = False
 
 
 class WordVoiceTensorRTDecoder:
@@ -160,12 +171,19 @@ class WordVoiceTensorRTDecoder:
                 "WordVoice TensorRT gate failed; stage=engine-deserialize; "
                 f"engine={self.engine_path}"
             )
-        self.context = self.engine.create_execution_context()
-        if self.context is None:
-            raise RuntimeError(
-                "WordVoice TensorRT gate failed; stage=context-create; "
-                f"engine={self.engine_path}"
-            )
+        context_states: list[_ExecutionContextState] = []
+        for context_index in range(2):
+            context = self.engine.create_execution_context()
+            if context is None:
+                raise RuntimeError(
+                    "WordVoice TensorRT gate failed; stage=context-create; "
+                    f"context_index={context_index}; engine={self.engine_path}"
+                )
+            context_states.append(_ExecutionContextState(context))
+        self._context_states = context_states
+        # Keep the first context available for diagnostics and compatibility;
+        # decode steps select the direction-specific state below.
+        self.context = context_states[0].context
         expected_names = self._expected_tensor_names()
         actual_names = {
             self.engine.get_tensor_name(index)
@@ -185,9 +203,6 @@ class WordVoiceTensorRTDecoder:
         self._steps = 0
         self._validated_mask_address: int | None = None
         self._parity: dict[str, float] | None = None
-        self._fixed_input_shapes_set = False
-        self._last_cache_shape: tuple[int, ...] | None = None
-        self._validated_output_shapes = False
         self._cache_buffer_slots: list[torch.Tensor | None] = [None, None]
         self._next_cache_slot = 0
         self._cache_buffer_allocations = 0
@@ -407,6 +422,14 @@ class WordVoiceTensorRTDecoder:
         cache_inputs: list[torch.Tensor] = []
         past_tokens: int | None = None
         input_cache_slot = self._cache_slot_for_legacy_cache(legacy_cache)
+        output_slot = (
+            self._next_cache_slot
+            if input_cache_slot is None
+            else 1 - input_cache_slot
+        )
+        self._next_cache_slot = 1 - output_slot
+        context_state = self._context_states[output_slot]
+        context = context_state.context
         for layer, pair in enumerate(legacy_cache):
             if not isinstance(pair, (tuple, list)) or len(pair) != 2:
                 raise RuntimeError(
@@ -448,15 +471,15 @@ class WordVoiceTensorRTDecoder:
                 f"expected=1..{self.max_past_tokens}; actual={past_tokens}"
             )
 
-        if not self._fixed_input_shapes_set:
+        if not context_state.fixed_input_shapes_set:
             # The token input has a fixed shape for this batch-one decoder.
             # TensorRT retains it for the lifetime of the execution context.
-            if not self.context.set_input_shape("inputs_embeds", tuple(inputs.shape)):
+            if not context.set_input_shape("inputs_embeds", tuple(inputs.shape)):
                 raise RuntimeError("WordVoice TensorRT failed to set inputs_embeds shape")
-            self._fixed_input_shapes_set = True
-        self.context.set_tensor_address("inputs_embeds", inputs.data_ptr())
+            context_state.fixed_input_shapes_set = True
+        context.set_tensor_address("inputs_embeds", inputs.data_ptr())
         cache_shape = tuple(cache_inputs[0].shape)
-        if self._last_cache_shape != cache_shape:
+        if context_state.last_cache_shape != cache_shape:
             # Cache length changes only when a new token is appended. Repeated
             # lengths (for example across lines) do not need another shape
             # negotiation; tensor addresses are still refreshed every step.
@@ -465,20 +488,27 @@ class WordVoiceTensorRTDecoder:
                 for kind in ("key", "value"):
                     tensor = cache_inputs[index]
                     name = cache_tensor_name(kind, layer)
-                    if not self.context.set_input_shape(name, tuple(tensor.shape)):
+                    if not context.set_input_shape(name, tuple(tensor.shape)):
                         raise RuntimeError(
                             "WordVoice TensorRT failed to set cache input shape; "
                             f"tensor={name}; shape={tuple(tensor.shape)}"
                         )
                     index += 1
-            self._last_cache_shape = cache_shape
-        index = 0
-        for layer in range(self.num_layers):
-            for kind in ("key", "value"):
-                self.context.set_tensor_address(
-                    cache_tensor_name(kind, layer), cache_inputs[index].data_ptr()
-                )
-                index += 1
+            context_state.last_cache_shape = cache_shape
+        input_cache_key = (
+            ("slot", input_cache_slot)
+            if input_cache_slot is not None
+            else ("ptr", cache_inputs[0].data_ptr())
+        )
+        if context_state.bound_input_cache_key != input_cache_key:
+            index = 0
+            for layer in range(self.num_layers):
+                for kind in ("key", "value"):
+                    context.set_tensor_address(
+                        cache_tensor_name(kind, layer), cache_inputs[index].data_ptr()
+                    )
+                    index += 1
+            context_state.bound_input_cache_key = input_cache_key
 
         hidden = torch.empty(
             (1, 1, self.hidden_size), device=inputs.device, dtype=self.dtype
@@ -486,20 +516,14 @@ class WordVoiceTensorRTDecoder:
         # Present shapes are deterministic from the negotiated cache length.
         # Validate the first execution, then keep the hot path free of 49 host
         # shape queries per token while retaining address and execute checks.
-        if not self._validated_output_shapes:
-            hidden_shape = tuple(self.context.get_tensor_shape("hidden_state"))
+        if not context_state.validated_output_shapes:
+            hidden_shape = tuple(context.get_tensor_shape("hidden_state"))
             if hidden_shape != tuple(hidden.shape):
                 raise RuntimeError(
                     "WordVoice TensorRT gate failed; stage=output-shape; "
                     f"tensor=hidden_state; expected={tuple(hidden.shape)}; actual={hidden_shape}"
                 )
-        self.context.set_tensor_address("hidden_state", hidden.data_ptr())
-        output_slot = (
-            self._next_cache_slot
-            if input_cache_slot is None
-            else 1 - input_cache_slot
-        )
-        self._next_cache_slot = 1 - output_slot
+        context.set_tensor_address("hidden_state", hidden.data_ptr())
         output_buffers = self._ensure_cache_buffer_slot(
             output_slot, device=inputs.device
         )
@@ -520,25 +544,25 @@ class WordVoiceTensorRTDecoder:
                     head_dim=self.head_dim,
                 )
                 name = cache_tensor_name(kind, layer, present=True)
-                if not self._validated_output_shapes:
-                    actual_shape = tuple(self.context.get_tensor_shape(name))
+                if not context_state.validated_output_shapes:
+                    actual_shape = tuple(context.get_tensor_shape(name))
                     if actual_shape != tuple(tensor.shape):
                         raise RuntimeError(
                             "WordVoice TensorRT gate failed; stage=output-shape; "
                             f"tensor={name}; expected={tuple(tensor.shape)}; "
                             f"actual={actual_shape}"
                         )
-                self.context.set_tensor_address(
-                    name, tensor.data_ptr()
-                )
+                if not context_state.output_addresses_bound:
+                    context.set_tensor_address(name, tensor.data_ptr())
                 pair.append(tensor)
                 index += 1
             present.append((pair[0], pair[1]))
-        self._validated_output_shapes = True
+        context_state.output_addresses_bound = True
+        context_state.validated_output_shapes = True
 
         current_stream = torch.cuda.current_stream(inputs.device)
         self._timing_start.record(current_stream)
-        if not self.context.execute_async_v3(current_stream.cuda_stream):
+        if not context.execute_async_v3(current_stream.cuda_stream):
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=execute; "
                 f"engine={self.engine_path}; past_tokens={past_tokens}"
