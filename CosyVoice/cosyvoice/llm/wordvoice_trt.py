@@ -315,6 +315,8 @@ class WordVoiceTensorRTDecoder:
         self._flat_cache_buffer_allocations = 0
         self._hidden_buffer_slots: list[torch.Tensor | None] = [None, None]
         self._hidden_buffer_allocations = 0
+        self._input_buffer: torch.Tensor | None = None
+        self._input_buffer_allocations = 0
 
     def _positive_int(self, name: str) -> int:
         value = self.manifest.get(name)
@@ -500,6 +502,30 @@ class WordVoiceTensorRTDecoder:
                 f"actual={hidden.device}/{hidden.dtype}"
             )
         return hidden
+
+    def _prepare_inputs(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        if inputs_embeds.dtype == self.dtype and inputs_embeds.is_contiguous():
+            return inputs_embeds
+        if self._input_buffer is None:
+            self._input_buffer = torch.empty(
+                tuple(inputs_embeds.shape),
+                device=inputs_embeds.device,
+                dtype=self.dtype,
+            )
+            self._input_buffer_allocations += 1
+        elif (
+            self._input_buffer.device != inputs_embeds.device
+            or self._input_buffer.dtype != self.dtype
+            or tuple(self._input_buffer.shape) != tuple(inputs_embeds.shape)
+        ):
+            raise RuntimeError(
+                "WordVoice TensorRT gate failed; stage=input-buffer-device; "
+                f"expected={inputs_embeds.device}/{self.dtype}/{tuple(inputs_embeds.shape)}; "
+                f"actual={self._input_buffer.device}/{self._input_buffer.dtype}/"
+                f"{tuple(self._input_buffer.shape)}"
+            )
+        self._input_buffer.copy_(inputs_embeds)
+        return self._input_buffer
 
     def _pack_eager_cache_to_flat(
         self, legacy_cache: Any, *, device: torch.device
@@ -725,7 +751,7 @@ class WordVoiceTensorRTDecoder:
                     f"actual_shape={tuple(masks.shape)}; actual_dtype={masks.dtype}"
                 )
             self._validated_mask_address = masks.data_ptr()
-        inputs = inputs_embeds.to(dtype=self.dtype).contiguous()
+        inputs = self._prepare_inputs(inputs_embeds)
         cache_inputs: list[torch.Tensor] = []
         past_tokens: int | None = None
         cache_shape: tuple[int, ...] | None = None
@@ -971,7 +997,7 @@ class WordVoiceTensorRTDecoder:
                 )
             self._validated_mask_address = masks.data_ptr()
 
-        inputs = inputs_embeds.to(dtype=self.dtype).contiguous()
+        inputs = self._prepare_inputs(inputs_embeds)
         input_cache_slot = (
             self._flat_cache_slot_for_legacy_cache(legacy_cache)
             if flat_state is None
@@ -1154,6 +1180,7 @@ class WordVoiceTensorRTDecoder:
             "native_cache_buffer_pool_allocations": self._cache_buffer_allocations,
             "native_flat_cache_buffer_allocations": self._flat_cache_buffer_allocations,
             "native_hidden_buffer_pool_allocations": self._hidden_buffer_allocations,
+            "native_input_buffer_allocations": self._input_buffer_allocations,
             "engine_sha256": self.manifest["engine_sha256"],
             "manifest_sha256": sha256(self.manifest_path),
             "tensorrt_version": self.manifest["tensorrt_version"],
