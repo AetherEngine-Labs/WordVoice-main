@@ -34,6 +34,7 @@ def cache_tensor_name(kind: str, layer: int, *, present: bool = False) -> str:
 def _flat_cache_view(
     buffer: torch.Tensor,
     *,
+    offset: int = 0,
     length: int,
     num_kv_heads: int,
     head_dim: int,
@@ -42,9 +43,9 @@ def _flat_cache_view(
 
     TensorRT receives only the device pointer, while the returned view keeps
     the dynamic shape expected by the rest of the WordVoice cache contract.
-    Starting at element zero is important: a sliced view of a full-capacity
-    four-dimensional tensor would be non-contiguous, but a prefix of a flat
-    allocation can be reshaped without introducing a stride change.
+    A sliced view of a full-capacity four-dimensional tensor would be
+    non-contiguous, but a range within a flat allocation can be reshaped
+    without introducing a stride change.
     """
 
     if buffer.ndim != 1:
@@ -53,12 +54,12 @@ def _flat_cache_view(
             f"expected=one-dimensional-buffer; actual_shape={tuple(buffer.shape)}"
         )
     element_count = num_kv_heads * length * head_dim
-    if element_count > buffer.numel():
+    if offset < 0 or offset + element_count > buffer.numel():
         raise RuntimeError(
             "WordVoice TensorRT gate failed; stage=cache-buffer-capacity; "
-            f"expected_at_least={element_count}; actual={buffer.numel()}"
+            f"expected_end={offset + element_count}; actual={buffer.numel()}"
         )
-    view = buffer.narrow(0, 0, element_count).view(
+    view = buffer.narrow(0, offset, element_count).view(
         1, num_kv_heads, length, head_dim
     )
     if not view.is_contiguous():
@@ -187,7 +188,7 @@ class WordVoiceTensorRTDecoder:
         self._fixed_input_shapes_set = False
         self._last_cache_shape: tuple[int, ...] | None = None
         self._validated_output_shapes = False
-        self._cache_buffer_slots: list[tuple[torch.Tensor, ...] | None] = [None, None]
+        self._cache_buffer_slots: list[torch.Tensor | None] = [None, None]
         self._next_cache_slot = 0
         self._cache_buffer_allocations = 0
 
@@ -220,35 +221,32 @@ class WordVoiceTensorRTDecoder:
             return None
         first_ptr = first_tensor.data_ptr()
         for index, buffers in enumerate(self._cache_buffer_slots):
-            if buffers is not None and buffers[0].data_ptr() == first_ptr:
+            if buffers is not None and buffers.data_ptr() == first_ptr:
                 return index
         return None
 
     def _ensure_cache_buffer_slot(
         self, slot: int, *, device: torch.device
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor:
         buffers = self._cache_buffer_slots[slot]
         if buffers is None:
-            element_count = (
+            cache_tensor_elements = (
                 self.num_kv_heads
                 * (self.max_past_tokens + 1)
                 * self.head_dim
             )
-            buffers = tuple(
-                torch.empty(
-                    (element_count,),
-                    device=device,
-                    dtype=self.dtype,
-                )
-                for _ in range(self.num_layers * 2)
+            buffers = torch.empty(
+                (cache_tensor_elements * self.num_layers * 2,),
+                device=device,
+                dtype=self.dtype,
             )
             self._cache_buffer_slots[slot] = buffers
             self._cache_buffer_allocations += 1
-        elif buffers[0].device != device or buffers[0].dtype != self.dtype:
+        elif buffers.device != device or buffers.dtype != self.dtype:
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=cache-buffer-device; "
                 f"expected={device}/{self.dtype}; "
-                f"actual={buffers[0].device}/{buffers[0].dtype}"
+                f"actual={buffers.device}/{buffers.dtype}"
             )
         return buffers
 
@@ -507,12 +505,16 @@ class WordVoiceTensorRTDecoder:
         )
         present: list[tuple[torch.Tensor, torch.Tensor]] = []
         output_length = past_tokens + 1
+        cache_tensor_capacity = (
+            self.num_kv_heads * (self.max_past_tokens + 1) * self.head_dim
+        )
         index = 0
         for layer in range(self.num_layers):
             pair: list[torch.Tensor] = []
             for kind in ("key", "value"):
                 tensor = _flat_cache_view(
-                    output_buffers[index],
+                    output_buffers,
+                    offset=index * cache_tensor_capacity,
                     length=output_length,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
