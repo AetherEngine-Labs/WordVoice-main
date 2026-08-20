@@ -14,23 +14,18 @@
 # limitations under the License.
 import hashlib
 import json
-import os, queue
-import random
+import os
 import time
-import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List, Generator
-import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-import math
 from transformers import Qwen2ForCausalLM
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
 from cosyvoice.utils.common import th_accuracy
-from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
 from cosyvoice.utils.losses import DynamicStyleLoss
@@ -411,7 +406,6 @@ class Qwen2LM(TransformerLM):
             
             # 计算嵌入
             dur_emb = self.duration_embedding(durations_input)
-            pau_emb = self.pause_embedding(pauses_input)
             bnd_emb = self.boundary_embedding(boundary)
             tone_emb = self.tone_embedding(tone)
             f0_emb = self.f0_embedding(f0)
@@ -647,9 +641,10 @@ class Qwen2LM(TransformerLM):
 
         # 常量预分配
         precomputed_bound_emb = self.speech_embedding.weight[self.bound_token].view(1, 1, -1)
-        # 注意：这里改为 1D tensor，以便后续 logits[:, forbidden_ids] 索引不报错
+        # Keep control-id tensors one-dimensional for direct in-place masking.
         forbidden_stop_ids = torch.tensor([self.eos_token], device=device, dtype=torch.long)
         forbidden_bound_ids = torch.tensor([self.bound_token], device=device, dtype=torch.long)
+        silent_token_ids = torch.tensor(self.silent_tokens, device=device, dtype=torch.long)
 
         reuse_enabled = bool(
             prepared_prefix_key
@@ -810,18 +805,18 @@ class Qwen2LM(TransformerLM):
             
             # 控制停止符与边界符
             if word_idx < len(word_list):
-                logits[:, forbidden_stop_ids] = -float('inf')
+                logits.index_fill_(1, forbidden_stop_ids, -float('inf'))
             # else:
             #     logits[:, forbidden_bound_ids] = negative_inf
             
             if better_infer is True:
                 if true_dur < final_dur:
                     # 比指定的时长短则强制模型输出有声音的token
-                    logits[:, self.silent_tokens] = -float('inf')
-                    logits[:, forbidden_bound_ids] = -float('inf')
+                    logits.index_fill_(1, silent_token_ids, -float('inf'))
+                    logits.index_fill_(1, forbidden_bound_ids, -float('inf'))
                 elif true_dur == final_dur:
                     # 留一帧缓冲
-                    logits[:, forbidden_bound_ids] = -float('inf')
+                    logits.index_fill_(1, forbidden_bound_ids, -float('inf'))
                 elif true_dur > final_dur:
                     # 最低静音与最大静音设置
                     pause_len = true_dur - final_dur
@@ -901,7 +896,7 @@ class Qwen2LM(TransformerLM):
                 final_f0 = pred_f0 if user_f0 == self.max_f0 else user_f0
                 final_eng = pred_eng if user_eng == self.max_energy else user_eng
 
-                if better_infer == True:
+                if better_infer:
                     if user_bnd == self.max_boundary:
                         final_bnd = min(final_bnd, 3) # 减少长停顿
                     if user_eng == self.max_energy:
