@@ -9,6 +9,7 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).parents[1] / "CosyVoice"))
 
 from cosyvoice.llm.wordvoice_trt import (
+    _FlatCacheState,
     WordVoiceTensorRTDecoder,
     _flat_cache_view,
     _flat_layer_cache_view,
@@ -101,6 +102,24 @@ class WordVoiceTensorRTBufferTest(unittest.TestCase):
         self.assertEqual(tuple(value.shape), (1, 2, 6, 3))
         self.assertTrue(torch.equal(key, flat[:, :, :2, :].permute(0, 2, 1, 3)))
         self.assertTrue(torch.equal(value, flat[:, :, 2:, :].permute(0, 2, 1, 3)))
+
+    def test_flat_cache_state_materializes_legacy_views_on_demand(self):
+        buffer = torch.arange(1 * 4 * 4 * 2, dtype=torch.float32)
+        state = _FlatCacheState(
+            buffer=buffer,
+            slot=1,
+            length=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=2,
+        )
+
+        legacy = state.to_legacy_cache()
+
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(tuple(legacy[0][0].shape), (1, 2, 4, 2))
+        self.assertTrue(torch.equal(legacy[0][0], buffer.view(1, 4, 4, 2)[:, :, :2].permute(0, 2, 1, 3)))
+        self.assertTrue(torch.equal(tuple(state)[0][1], legacy[0][1]))
 
     def test_cache_slots_are_reused_and_identifiable(self):
         decoder = object.__new__(WordVoiceTensorRTDecoder)
