@@ -438,7 +438,7 @@ class WordVoiceTensorRTDecoder:
             self._timing_stream = current_stream
             self._timing_start.record(current_stream)
             self._timing_active = True
-        elif self._timing_stream is not current_stream:
+        elif self._timing_stream.cuda_stream != current_stream.cuda_stream:
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=timing-stream; "
                 "all decoder steps for one synthesis call must use one CUDA stream"
