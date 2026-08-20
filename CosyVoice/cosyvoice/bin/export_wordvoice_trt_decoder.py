@@ -17,6 +17,7 @@ from transformers.cache_utils import DynamicCache
 
 from cosyvoice.llm.wordvoice_trt import (
     ENGINE_FILENAME,
+    FLAT_CACHE_LAYOUT,
     MANIFEST_FILENAME,
     MANIFEST_SCHEMA,
     cache_tensor_name,
@@ -25,17 +26,40 @@ from cosyvoice.llm.wordvoice_trt import (
 
 
 class Qwen2DecodeStep(torch.nn.Module):
-    def __init__(self, model: torch.nn.Module, num_layers: int, precision: str):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        num_layers: int,
+        num_kv_heads: int,
+        precision: str,
+        cache_layout: str,
+    ):
         super().__init__()
         self.model = model
         self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
         self.precision = precision
+        self.cache_layout = cache_layout
 
     def forward(self, inputs_embeds: torch.Tensor, *flat_cache: torch.Tensor):
-        legacy_cache = tuple(
-            (flat_cache[index], flat_cache[index + 1])
-            for index in range(0, len(flat_cache), 2)
-        )
+        if self.cache_layout == FLAT_CACHE_LAYOUT:
+            flat_cache_tensor = flat_cache[0]
+            legacy_cache = tuple(
+                (
+                    flat_cache_tensor[
+                        :, :, index * self.num_kv_heads : (index + 1) * self.num_kv_heads, :
+                    ].permute(0, 2, 1, 3),
+                    flat_cache_tensor[
+                        :, :, (index + 1) * self.num_kv_heads : (index + 2) * self.num_kv_heads, :
+                    ].permute(0, 2, 1, 3),
+                )
+                for index in range(0, self.num_layers * 2, 2)
+            )
+        else:
+            legacy_cache = tuple(
+                (flat_cache[index], flat_cache[index + 1])
+                for index in range(0, len(flat_cache), 2)
+            )
         dynamic_cache = DynamicCache.from_legacy_cache(legacy_cache)
         precision_context = (
             torch.cuda.amp.autocast(dtype=torch.float16)
@@ -52,6 +76,16 @@ class Qwen2DecodeStep(torch.nn.Module):
         cache = output.past_key_values
         if hasattr(cache, "to_legacy_cache"):
             cache = cache.to_legacy_cache()
+        if self.cache_layout == FLAT_CACHE_LAYOUT:
+            flattened = torch.cat(
+                [
+                    tensor.permute(0, 2, 1, 3)
+                    for pair in cache
+                    for tensor in pair
+                ],
+                dim=2,
+            )
+            return (output.last_hidden_state[:, -1:, :], flattened)
         flattened = tuple(tensor for pair in cache for tensor in pair)
         return (output.last_hidden_state[:, -1:, :], *flattened)
 
@@ -101,8 +135,11 @@ def export_onnx(
     head_dim: int,
     hidden_size: int,
     precision: str,
+    cache_layout: str,
 ) -> None:
-    wrapper = Qwen2DecodeStep(model, num_layers, precision).eval()
+    wrapper = Qwen2DecodeStep(
+        model, num_layers, num_kv_heads, precision, cache_layout
+    ).eval()
     tensor_dtype = torch.float16 if precision == "autocast_fp16" else torch.float32
     inputs = [
         torch.linspace(
@@ -113,34 +150,59 @@ def export_onnx(
             dtype=tensor_dtype,
         ).reshape(1, 1, hidden_size)
     ]
-    for _ in range(num_layers):
-        for _kind in ("key", "value"):
-            inputs.append(
-                torch.zeros(
-                    1,
-                    num_kv_heads,
-                    32,
-                    head_dim,
-                    device="cuda",
-                    dtype=tensor_dtype,
-                )
+    if cache_layout == FLAT_CACHE_LAYOUT:
+        channels = num_layers * 2 * num_kv_heads
+        inputs.append(
+            torch.zeros(
+                1,
+                32,
+                channels,
+                head_dim,
+                device="cuda",
+                dtype=tensor_dtype,
             )
-    input_names = ["inputs_embeds"] + [
-        cache_tensor_name(kind, layer)
-        for layer in range(num_layers)
-        for kind in ("key", "value")
-    ]
-    output_names = ["hidden_state"] + [
-        cache_tensor_name(kind, layer, present=True)
-        for layer in range(num_layers)
-        for kind in ("key", "value")
-    ]
-    dynamic_axes = {
-        name: {2: "past_tokens"} for name in input_names if name != "inputs_embeds"
-    }
-    dynamic_axes.update(
-        {name: {2: "present_tokens"} for name in output_names if name != "hidden_state"}
-    )
+        )
+        input_names = ["inputs_embeds", "past_cache"]
+        output_names = ["hidden_state", "present_cache"]
+        dynamic_axes = {
+            "past_cache": {1: "past_tokens"},
+            "present_cache": {1: "present_tokens"},
+        }
+    else:
+        for _ in range(num_layers):
+            for _kind in ("key", "value"):
+                inputs.append(
+                    torch.zeros(
+                        1,
+                        num_kv_heads,
+                        32,
+                        head_dim,
+                        device="cuda",
+                        dtype=tensor_dtype,
+                    )
+                )
+        input_names = ["inputs_embeds"] + [
+            cache_tensor_name(kind, layer)
+            for layer in range(num_layers)
+            for kind in ("key", "value")
+        ]
+        output_names = ["hidden_state"] + [
+            cache_tensor_name(kind, layer, present=True)
+            for layer in range(num_layers)
+            for kind in ("key", "value")
+        ]
+        dynamic_axes = {
+            name: {2: "past_tokens"}
+            for name in input_names
+            if name != "inputs_embeds"
+        }
+        dynamic_axes.update(
+            {
+                name: {2: "present_tokens"}
+                for name in output_names
+                if name != "hidden_state"
+            }
+        )
     with torch.inference_mode():
         torch.onnx.export(
             wrapper,
@@ -166,6 +228,7 @@ def build_engine(
     opt_past_tokens: int,
     max_past_tokens: int,
     precision: str,
+    cache_layout: str,
 ) -> None:
     import tensorrt as trt
 
@@ -191,14 +254,23 @@ def build_engine(
         (1, 1, hidden_size),
         (1, 1, hidden_size),
     )
-    for layer in range(num_layers):
-        for kind in ("key", "value"):
-            profile.set_shape(
-                cache_tensor_name(kind, layer),
-                (1, num_kv_heads, 1, head_dim),
-                (1, num_kv_heads, opt_past_tokens, head_dim),
-                (1, num_kv_heads, max_past_tokens, head_dim),
-            )
+    if cache_layout == FLAT_CACHE_LAYOUT:
+        channels = num_layers * 2 * num_kv_heads
+        profile.set_shape(
+            "past_cache",
+            (1, 1, channels, head_dim),
+            (1, opt_past_tokens, channels, head_dim),
+            (1, max_past_tokens, channels, head_dim),
+        )
+    else:
+        for layer in range(num_layers):
+            for kind in ("key", "value"):
+                profile.set_shape(
+                    cache_tensor_name(kind, layer),
+                    (1, num_kv_heads, 1, head_dim),
+                    (1, num_kv_heads, opt_past_tokens, head_dim),
+                    (1, num_kv_heads, max_past_tokens, head_dim),
+                )
     config.add_optimization_profile(profile)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
@@ -218,6 +290,11 @@ def main() -> int:
     parser.add_argument("--max-past-tokens", type=int, default=2048)
     parser.add_argument(
         "--precision", choices=("fp32", "autocast_fp16"), required=True
+    )
+    parser.add_argument(
+        "--cache-layout",
+        choices=("layered", FLAT_CACHE_LAYOUT),
+        default="layered",
     )
     parser.add_argument("--replace-rejected-engine", action="store_true")
     parser.add_argument("--remove-rejected-staging-only", action="store_true")
@@ -339,6 +416,7 @@ def main() -> int:
             head_dim=head_dim,
             hidden_size=config.hidden_size,
             precision=args.precision,
+            cache_layout=args.cache_layout,
         )
         export_seconds = time.perf_counter() - export_started
         import onnx
@@ -355,6 +433,7 @@ def main() -> int:
             opt_past_tokens=args.opt_past_tokens,
             max_past_tokens=args.max_past_tokens,
             precision=args.precision,
+            cache_layout=args.cache_layout,
         )
         build_seconds = time.perf_counter() - build_started
         import tensorrt as trt
@@ -365,6 +444,7 @@ def main() -> int:
             "schema": MANIFEST_SCHEMA,
             "status": "engine_built_parity_pending",
             "precision": args.precision,
+            "cache_layout": args.cache_layout,
             "platform": platform.platform(),
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
