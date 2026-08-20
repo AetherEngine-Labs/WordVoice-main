@@ -644,7 +644,9 @@ class Qwen2LM(TransformerLM):
         # Keep control-id tensors one-dimensional for direct in-place masking.
         forbidden_stop_ids = torch.tensor([self.eos_token], device=device, dtype=torch.long)
         forbidden_bound_ids = torch.tensor([self.bound_token], device=device, dtype=torch.long)
-        silent_token_ids = torch.tensor(self.silent_tokens, device=device, dtype=torch.long)
+        silent_and_bound_ids = torch.tensor(
+            self.silent_tokens + [self.bound_token], device=device, dtype=torch.long
+        )
 
         reuse_enabled = bool(
             prepared_prefix_key
@@ -820,8 +822,7 @@ class Qwen2LM(TransformerLM):
             if better_infer is True:
                 if true_dur < final_dur:
                     # 比指定的时长短则强制模型输出有声音的token
-                    logits.index_fill_(1, silent_token_ids, -float('inf'))
-                    logits.index_fill_(1, forbidden_bound_ids, -float('inf'))
+                    logits.index_fill_(1, silent_and_bound_ids, -float('inf'))
                 elif true_dur == final_dur:
                     # 留一帧缓冲
                     logits.index_fill_(1, forbidden_bound_ids, -float('inf'))
