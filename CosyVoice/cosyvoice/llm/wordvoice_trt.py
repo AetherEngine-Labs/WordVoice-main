@@ -31,6 +31,44 @@ def cache_tensor_name(kind: str, layer: int, *, present: bool = False) -> str:
     return f"{prefix}_{kind}_{layer}"
 
 
+def _flat_cache_view(
+    buffer: torch.Tensor,
+    *,
+    length: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Expose an exact-shaped contiguous view into a flat cache buffer.
+
+    TensorRT receives only the device pointer, while the returned view keeps
+    the dynamic shape expected by the rest of the WordVoice cache contract.
+    Starting at element zero is important: a sliced view of a full-capacity
+    four-dimensional tensor would be non-contiguous, but a prefix of a flat
+    allocation can be reshaped without introducing a stride change.
+    """
+
+    if buffer.ndim != 1:
+        raise RuntimeError(
+            "WordVoice TensorRT gate failed; stage=cache-buffer; "
+            f"expected=one-dimensional-buffer; actual_shape={tuple(buffer.shape)}"
+        )
+    element_count = num_kv_heads * length * head_dim
+    if element_count > buffer.numel():
+        raise RuntimeError(
+            "WordVoice TensorRT gate failed; stage=cache-buffer-capacity; "
+            f"expected_at_least={element_count}; actual={buffer.numel()}"
+        )
+    view = buffer.narrow(0, 0, element_count).view(
+        1, num_kv_heads, length, head_dim
+    )
+    if not view.is_contiguous():
+        raise RuntimeError(
+            "WordVoice TensorRT gate failed; stage=cache-buffer-layout; "
+            f"expected=contiguous; actual_strides={view.stride()}"
+        )
+    return view
+
+
 class WordVoiceTensorRTDecoder:
     """Run only cached single-token decoder steps in a TensorRT engine.
 
@@ -149,6 +187,9 @@ class WordVoiceTensorRTDecoder:
         self._fixed_input_shapes_set = False
         self._last_cache_shape: tuple[int, ...] | None = None
         self._validated_output_shapes = False
+        self._cache_buffer_slots: list[tuple[torch.Tensor, ...] | None] = [None, None]
+        self._next_cache_slot = 0
+        self._cache_buffer_allocations = 0
 
     def _positive_int(self, name: str) -> int:
         value = self.manifest.get(name)
@@ -166,6 +207,50 @@ class WordVoiceTensorRTDecoder:
                 names.add(cache_tensor_name(kind, layer))
                 names.add(cache_tensor_name(kind, layer, present=True))
         return names
+
+    def _cache_slot_for_legacy_cache(self, legacy_cache: Any) -> int | None:
+        if (
+            not legacy_cache
+            or not isinstance(legacy_cache[0], (tuple, list))
+            or not legacy_cache[0]
+        ):
+            return None
+        first_tensor = legacy_cache[0][0]
+        if not isinstance(first_tensor, torch.Tensor):
+            return None
+        first_ptr = first_tensor.data_ptr()
+        for index, buffers in enumerate(self._cache_buffer_slots):
+            if buffers is not None and buffers[0].data_ptr() == first_ptr:
+                return index
+        return None
+
+    def _ensure_cache_buffer_slot(
+        self, slot: int, *, device: torch.device
+    ) -> tuple[torch.Tensor, ...]:
+        buffers = self._cache_buffer_slots[slot]
+        if buffers is None:
+            element_count = (
+                self.num_kv_heads
+                * (self.max_past_tokens + 1)
+                * self.head_dim
+            )
+            buffers = tuple(
+                torch.empty(
+                    (element_count,),
+                    device=device,
+                    dtype=self.dtype,
+                )
+                for _ in range(self.num_layers * 2)
+            )
+            self._cache_buffer_slots[slot] = buffers
+            self._cache_buffer_allocations += 1
+        elif buffers[0].device != device or buffers[0].dtype != self.dtype:
+            raise RuntimeError(
+                "WordVoice TensorRT gate failed; stage=cache-buffer-device; "
+                f"expected={device}/{self.dtype}; "
+                f"actual={buffers[0].device}/{buffers[0].dtype}"
+            )
+        return buffers
 
     def validate_against_eager(self, qwen_model: torch.nn.Module) -> dict[str, float]:
         """Prove the loaded engine matches this checkpoint before activation."""
@@ -323,6 +408,7 @@ class WordVoiceTensorRTDecoder:
         inputs = inputs_embeds.to(dtype=self.dtype).contiguous()
         cache_inputs: list[torch.Tensor] = []
         past_tokens: int | None = None
+        input_cache_slot = self._cache_slot_for_legacy_cache(legacy_cache)
         for layer, pair in enumerate(legacy_cache):
             if not isinstance(pair, (tuple, list)) or len(pair) != 2:
                 raise RuntimeError(
@@ -353,7 +439,11 @@ class WordVoiceTensorRTDecoder:
                         "WordVoice TensorRT gate failed; stage=cache-length; "
                         f"expected={past_tokens}; actual={shape[2]}; layer={layer}"
                     )
-                cache_inputs.append(tensor.to(dtype=self.dtype).contiguous())
+                if tensor.dtype != self.dtype:
+                    tensor = tensor.to(dtype=self.dtype)
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                cache_inputs.append(tensor)
         if past_tokens is None or not 1 <= past_tokens <= self.max_past_tokens:
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=cache-length; "
@@ -406,14 +496,26 @@ class WordVoiceTensorRTDecoder:
                     f"tensor=hidden_state; expected={tuple(hidden.shape)}; actual={hidden_shape}"
                 )
         self.context.set_tensor_address("hidden_state", hidden.data_ptr())
+        output_slot = (
+            self._next_cache_slot
+            if input_cache_slot is None
+            else 1 - input_cache_slot
+        )
+        self._next_cache_slot = 1 - output_slot
+        output_buffers = self._ensure_cache_buffer_slot(
+            output_slot, device=inputs.device
+        )
         present: list[tuple[torch.Tensor, torch.Tensor]] = []
+        output_length = past_tokens + 1
+        index = 0
         for layer in range(self.num_layers):
             pair: list[torch.Tensor] = []
             for kind in ("key", "value"):
-                tensor = torch.empty(
-                    (1, self.num_kv_heads, past_tokens + 1, self.head_dim),
-                    device=inputs.device,
-                    dtype=self.dtype,
+                tensor = _flat_cache_view(
+                    output_buffers[index],
+                    length=output_length,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
                 )
                 name = cache_tensor_name(kind, layer, present=True)
                 if not self._validated_output_shapes:
@@ -428,6 +530,7 @@ class WordVoiceTensorRTDecoder:
                     name, tensor.data_ptr()
                 )
                 pair.append(tensor)
+                index += 1
             present.append((pair[0], pair[1]))
         self._validated_output_shapes = True
 
@@ -459,6 +562,7 @@ class WordVoiceTensorRTDecoder:
             "native_host_seconds": round(self._host_seconds, 3),
             "native_transfer_seconds": 0.0,
             "native_decode_steps": self._steps,
+            "native_cache_buffer_pool_allocations": self._cache_buffer_allocations,
             "engine_sha256": self.manifest["engine_sha256"],
             "manifest_sha256": sha256(self.manifest_path),
             "tensorrt_version": self.manifest["tensorrt_version"],
