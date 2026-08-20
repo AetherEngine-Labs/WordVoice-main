@@ -662,25 +662,28 @@ class Qwen2LM(TransformerLM):
             text_emb = self.llm.model.model.embed_tokens(text)
             style_embs = []
             word_embs_list = []
+            prompt_word_count = len(start_list)
             for i in range(len(word_list)):
                 w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
                 word_embs_list.append(w_emb)
+                if i >= prompt_word_count:
+                    continue
                 d = torch.clamp(
                     torch.tensor([dur_list[i]], device=device, dtype=torch.long),
                     0,
                     self.max_duration - 1,
                 )
-                b = torch.tensor([bnd_list[i]], device=device, dtype=torch.long)
-                t = torch.tensor([tone_list[i]], device=device, dtype=torch.long)
-                e = torch.tensor([eng_list[i]], device=device, dtype=torch.long)
-                f = torch.tensor([f0_list[i]], device=device, dtype=torch.long)
+                b = bnd_list[i]
+                t = tone_list[i]
+                e = eng_list[i]
+                f = f0_list[i]
                 style_embs.append(torch.stack([
                     w_emb,
-                    self.duration_embedding(d).view(-1),
-                    self.boundary_embedding(b).view(-1),
-                    self.tone_embedding(t).view(-1),
-                    self.f0_embedding(f).view(-1),
-                    self.energy_embedding(e).view(-1),
+                    self.duration_embedding.weight[int(d.item())],
+                    self.boundary_embedding.weight[int(b)],
+                    self.tone_embedding.weight[int(t)],
+                    self.f0_embedding.weight[int(f)],
+                    self.energy_embedding.weight[int(e)],
                 ], dim=0).mean(dim=0).view(1, 1, -1))
 
             word_idx = 0
@@ -821,22 +824,19 @@ class Qwen2LM(TransformerLM):
                     logits[:, forbidden_bound_ids] = -float('inf')
                 elif true_dur > final_dur:
                     # 最低静音与最大静音设置
-                    silent_masks = torch.ones(logits.shape[-1], dtype=torch.bool, device=logits.device)
                     pause_len = true_dur - final_dur
                     allows_silence = pause_len < self.max_pause_lens[final_bnd]
                     allows_terminal = pause_len > self.max_pause_lens[final_bnd-1]
                     if allows_silence:
-                        # 到了截止时间段则强制模型输出静音片段
-                        silent_masks[self.silent_tokens] = False
-                    if allows_terminal:
-                        # 到了停顿时间自动截停
-                        silent_masks[self.bound_token] = False
-                        silent_masks[self.eos_token] = False
-                    if not allows_silence and not allows_terminal:
-                        # 如果全被 mask 了，强制允许输出边界符，强行结束当前字的静音
-                        silent_masks[self.bound_token] = False
+                        mask_indices = self._wordvoice_decode_mask_indices(logits.device)[
+                            1 if allows_terminal else 0
+                        ]
+                    elif allows_terminal:
+                        mask_indices = self._wordvoice_decode_mask_indices(logits.device)[2]
+                    else:
+                        mask_indices = self._wordvoice_decode_mask_indices(logits.device)[3]
 
-                    logits[:, silent_masks] = -float('inf')
+                    logits.index_fill_(1, mask_indices, -float('inf'))
 
             # 采样
             token_id = self.sampling_ids(logits.squeeze(dim=0), generate_speech_token, sampling, ignore_eos=True if step < min_len else False)
@@ -917,16 +917,11 @@ class Qwen2LM(TransformerLM):
                 
                 # 4. 动态组装 Style Embedding
                 w_emb = word_embs_list[word_idx]
-                control_ids = torch.tensor(
-                    [final_dur, final_bnd, final_tone, final_f0, final_eng],
-                    device=device,
-                    dtype=torch.long,
-                )
-                d_emb = self.duration_embedding(control_ids[0:1]).view(-1)
-                b_emb = self.boundary_embedding(control_ids[1:2]).view(-1)
-                t_emb = self.tone_embedding(control_ids[2:3]).view(-1)
-                f_emb = self.f0_embedding(control_ids[3:4]).view(-1)
-                e_emb = self.energy_embedding(control_ids[4:5]).view(-1)
+                d_emb = self.duration_embedding.weight[final_dur]
+                b_emb = self.boundary_embedding.weight[final_bnd]
+                t_emb = self.tone_embedding.weight[final_tone]
+                f_emb = self.f0_embedding.weight[final_f0]
+                e_emb = self.energy_embedding.weight[final_eng]
                 
                 dynamic_tot_emb = torch.stack([w_emb, d_emb, b_emb, t_emb, f_emb, e_emb], dim=0).mean(dim=0).view(1, 1, -1)
                 
@@ -990,6 +985,8 @@ class WordVoiceLM(Qwen2LM):
         self.max_energy = 20
         self.silent_tokens = [1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323]
         self.max_pause_lens = [0, 1, 4, 10, 15]
+        self._wordvoice_mask_cache_device = None
+        self._wordvoice_mask_indices = None
 
         self.speech_embedding = torch.nn.Embedding(speech_token_size + 200, llm_input_size)
         self.duration_embedding = torch.nn.Embedding(self.max_duration + 1, llm_input_size)
@@ -1034,3 +1031,23 @@ class WordVoiceLM(Qwen2LM):
         self._prepared_prefix_misses = 0
         if online_feature is True:
             self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v3.batch.onnx'))
+
+    def _wordvoice_decode_mask_indices(self, device):
+        """Return cached indices for the three WordVoice silence masks."""
+        if self._wordvoice_mask_cache_device != device:
+            vocab_size = self.llm_decoder.out_features
+
+            def masked_indices(exempt_ids):
+                mask = torch.ones(vocab_size, dtype=torch.bool, device=device)
+                mask[torch.tensor(exempt_ids, dtype=torch.long, device=device)] = False
+                return torch.nonzero(mask, as_tuple=True)[0]
+
+            silent = list(self.silent_tokens)
+            self._wordvoice_mask_indices = (
+                masked_indices(silent),
+                masked_indices(silent + [self.bound_token, self.eos_token]),
+                masked_indices([self.bound_token, self.eos_token]),
+                masked_indices([self.bound_token]),
+            )
+            self._wordvoice_mask_cache_device = device
+        return self._wordvoice_mask_indices
