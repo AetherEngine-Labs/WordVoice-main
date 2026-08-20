@@ -372,12 +372,6 @@ class WordVoiceTensorRTDecoder:
                 self.context.set_tensor_address(name, tensor.data_ptr())
                 index += 1
 
-        missing = self.context.infer_shapes()
-        if missing:
-            raise RuntimeError(
-                "WordVoice TensorRT gate failed; stage=shape-inference; "
-                f"insufficient_tensors={missing}"
-            )
         hidden = torch.empty(
             (1, 1, self.hidden_size), device=inputs.device, dtype=self.dtype
         )
