@@ -131,6 +131,8 @@ class _ExecutionContextState:
     last_cache_shape: tuple[int, ...] | None = None
     validated_output_shapes: bool = False
     bound_input_cache_key: tuple[str, int] | None = None
+    bound_input_embedding_ptr: int | None = None
+    hidden_address_bound: bool = False
     output_addresses_bound: bool = False
 
 
@@ -857,7 +859,9 @@ class WordVoiceTensorRTDecoder:
             if not context.set_input_shape("inputs_embeds", tuple(inputs.shape)):
                 raise RuntimeError("WordVoice TensorRT failed to set inputs_embeds shape")
             context_state.fixed_input_shapes_set = True
-        context.set_tensor_address("inputs_embeds", inputs.data_ptr())
+        if context_state.bound_input_embedding_ptr != inputs.data_ptr():
+            context.set_tensor_address("inputs_embeds", inputs.data_ptr())
+            context_state.bound_input_embedding_ptr = inputs.data_ptr()
         if cache_shape is None:
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=cache-shape; "
@@ -900,7 +904,9 @@ class WordVoiceTensorRTDecoder:
                     "WordVoice TensorRT gate failed; stage=output-shape; "
                     f"tensor=hidden_state; expected={tuple(hidden.shape)}; actual={hidden_shape}"
                 )
-        context.set_tensor_address("hidden_state", hidden.data_ptr())
+        if not context_state.hidden_address_bound:
+            context.set_tensor_address("hidden_state", hidden.data_ptr())
+            context_state.hidden_address_bound = True
         output_buffers = self._ensure_cache_buffer_slot(
             output_slot, device=inputs.device
         )
@@ -1101,7 +1107,9 @@ class WordVoiceTensorRTDecoder:
             if not context.set_input_shape("inputs_embeds", tuple(inputs.shape)):
                 raise RuntimeError("WordVoice TensorRT failed to set inputs_embeds shape")
             context_state.fixed_input_shapes_set = True
-        context.set_tensor_address("inputs_embeds", inputs.data_ptr())
+        if context_state.bound_input_embedding_ptr != inputs.data_ptr():
+            context.set_tensor_address("inputs_embeds", inputs.data_ptr())
+            context_state.bound_input_embedding_ptr = inputs.data_ptr()
         if context_state.last_cache_shape != flat_input_shape:
             if not context.set_input_shape("past_cache", flat_input_shape):
                 raise RuntimeError(
@@ -1121,7 +1129,9 @@ class WordVoiceTensorRTDecoder:
                     "WordVoice TensorRT gate failed; stage=output-shape; "
                     f"tensor=hidden_state; expected={tuple(hidden.shape)}; actual={hidden_shape}"
                 )
-        context.set_tensor_address("hidden_state", hidden.data_ptr())
+        if not context_state.hidden_address_bound:
+            context.set_tensor_address("hidden_state", hidden.data_ptr())
+            context_state.hidden_address_bound = True
         output_buffer = self._ensure_flat_cache_buffer_slot(
             output_slot, device=inputs.device
         )
