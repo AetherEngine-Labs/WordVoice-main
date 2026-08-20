@@ -666,23 +666,28 @@ class Qwen2LM(TransformerLM):
             else:
                 word_embs_list = []
             prompt_word_count = len(start_list)
-            for i in range(len(word_list)):
-                w_emb = word_embs_list[i]
-                if i >= prompt_word_count:
-                    continue
-                d = min(max(int(dur_list[i]), 0), self.max_duration - 1)
-                b = bnd_list[i]
-                t = tone_list[i]
-                e = eng_list[i]
-                f = f0_list[i]
-                style_embs.append(torch.stack([
-                    w_emb,
-                    self.duration_embedding.weight[d],
-                    self.boundary_embedding.weight[int(b)],
-                    self.tone_embedding.weight[int(t)],
-                    self.f0_embedding.weight[int(f)],
-                    self.energy_embedding.weight[int(e)],
-                ], dim=0).mean(dim=0).view(1, 1, -1))
+            if prompt_word_count:
+                prompt_control_ids = torch.tensor([
+                    [
+                        min(max(int(dur_list[i]), 0), self.max_duration - 1),
+                        int(bnd_list[i]),
+                        int(tone_list[i]),
+                        int(f0_list[i]),
+                        int(eng_list[i]),
+                    ]
+                    for i in range(prompt_word_count)
+                ], device=device, dtype=torch.long)
+                prompt_word_embs = torch.stack(
+                    word_embs_list[:prompt_word_count], dim=0
+                )
+                style_embs = torch.stack([
+                    prompt_word_embs,
+                    self.duration_embedding.weight[prompt_control_ids[:, 0]],
+                    self.boundary_embedding.weight[prompt_control_ids[:, 1]],
+                    self.tone_embedding.weight[prompt_control_ids[:, 2]],
+                    self.f0_embedding.weight[prompt_control_ids[:, 3]],
+                    self.energy_embedding.weight[prompt_control_ids[:, 4]],
+                ], dim=0).mean(dim=0)
 
             word_idx = 0
             prompt_embs_list = []
