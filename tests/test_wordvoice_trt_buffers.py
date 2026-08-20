@@ -1,8 +1,10 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
+from torch import nn
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "CosyVoice"))
 
@@ -12,9 +14,60 @@ from cosyvoice.llm.wordvoice_trt import (
     _flat_layer_cache_view,
     _flat_token_major_view,
 )
+from cosyvoice.bin import export_wordvoice_trt_decoder as exporter
 
 
 class WordVoiceTensorRTBufferTest(unittest.TestCase):
+    def test_flat_exporter_round_trips_legacy_cache_layout(self):
+        class IdentityDynamicCache:
+            @classmethod
+            def from_legacy_cache(cls, legacy_cache):
+                return legacy_cache
+
+        class AppendOneToken(nn.Module):
+            def forward(self, inputs_embeds, past_key_values, **_kwargs):
+                present = tuple(
+                    (
+                        torch.cat(
+                            (key, torch.full_like(key[:, :, :1, :], 10.0)),
+                            dim=2,
+                        ),
+                        torch.cat(
+                            (value, torch.full_like(value[:, :, :1, :], 20.0)),
+                            dim=2,
+                        ),
+                    )
+                    for key, value in past_key_values
+                )
+                return SimpleNamespace(
+                    last_hidden_state=inputs_embeds,
+                    past_key_values=present,
+                )
+
+        original_dynamic_cache = exporter.DynamicCache
+        exporter.DynamicCache = IdentityDynamicCache
+        try:
+            wrapper = exporter.Qwen2DecodeStep(
+                AppendOneToken(),
+                num_layers=1,
+                num_kv_heads=2,
+                precision="fp32",
+                cache_layout="token-major-flat-v1",
+            )
+            flat_input = torch.arange(1 * 3 * 4 * 2, dtype=torch.float32).reshape(
+                1, 3, 4, 2
+            )
+            _hidden, flat_output = wrapper(
+                torch.zeros(1, 1, 8), flat_input
+            )
+        finally:
+            exporter.DynamicCache = original_dynamic_cache
+
+        self.assertEqual(tuple(flat_output.shape), (1, 4, 4, 2))
+        self.assertTrue(torch.equal(flat_output[:, :3], flat_input))
+        self.assertTrue(torch.equal(flat_output[:, 3, :2], torch.full((1, 2, 2), 10.0)))
+        self.assertTrue(torch.equal(flat_output[:, 3, 2:], torch.full((1, 2, 2), 20.0)))
+
     def test_token_major_flat_cache_reconstructs_legacy_views(self):
         buffer = torch.arange(2 * 6 * 4 * 3, dtype=torch.float32)
 
