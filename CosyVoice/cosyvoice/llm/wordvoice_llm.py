@@ -14,23 +14,18 @@
 # limitations under the License.
 import hashlib
 import json
-import os, queue
-import random
+import os
 import time
-import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List, Generator
-import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-import math
 from transformers import Qwen2ForCausalLM
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
 from cosyvoice.utils.common import th_accuracy
-from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
 from cosyvoice.utils.losses import DynamicStyleLoss
@@ -411,7 +406,6 @@ class Qwen2LM(TransformerLM):
             
             # 计算嵌入
             dur_emb = self.duration_embedding(durations_input)
-            pau_emb = self.pause_embedding(pauses_input)
             bnd_emb = self.boundary_embedding(boundary)
             tone_emb = self.tone_embedding(tone)
             f0_emb = self.f0_embedding(f0)
@@ -647,9 +641,12 @@ class Qwen2LM(TransformerLM):
 
         # 常量预分配
         precomputed_bound_emb = self.speech_embedding.weight[self.bound_token].view(1, 1, -1)
-        # 注意：这里改为 1D tensor，以便后续 logits[:, forbidden_ids] 索引不报错
+        # Keep control-id tensors one-dimensional for direct in-place masking.
         forbidden_stop_ids = torch.tensor([self.eos_token], device=device, dtype=torch.long)
         forbidden_bound_ids = torch.tensor([self.bound_token], device=device, dtype=torch.long)
+        silent_and_bound_ids = torch.tensor(
+            self.silent_tokens + [self.bound_token], device=device, dtype=torch.long
+        )
 
         reuse_enabled = bool(
             prepared_prefix_key
@@ -661,30 +658,38 @@ class Qwen2LM(TransformerLM):
             prepare_started = time.perf_counter()
             text_emb = self.llm.model.model.embed_tokens(text)
             style_embs = []
-            word_embs_list = []
-            prompt_word_count = len(start_list)
-            for i in range(len(word_list)):
-                w_emb = self.llm.model.model.embed_tokens(word_list[i].to(device))[0,0,:]
-                word_embs_list.append(w_emb)
-                if i >= prompt_word_count:
-                    continue
-                d = torch.clamp(
-                    torch.tensor([dur_list[i]], device=device, dtype=torch.long),
-                    0,
-                    self.max_duration - 1,
+            if word_list:
+                first_word_tokens = torch.cat(
+                    [word[:, :1] for word in word_list], dim=1
+                ).to(device)
+                word_embs_list = list(
+                    self.llm.model.model.embed_tokens(first_word_tokens)[0].unbind(dim=0)
                 )
-                b = bnd_list[i]
-                t = tone_list[i]
-                e = eng_list[i]
-                f = f0_list[i]
-                style_embs.append(torch.stack([
-                    w_emb,
-                    self.duration_embedding.weight[int(d.item())],
-                    self.boundary_embedding.weight[int(b)],
-                    self.tone_embedding.weight[int(t)],
-                    self.f0_embedding.weight[int(f)],
-                    self.energy_embedding.weight[int(e)],
-                ], dim=0).mean(dim=0).view(1, 1, -1))
+            else:
+                word_embs_list = []
+            prompt_word_count = len(start_list)
+            if prompt_word_count:
+                prompt_control_ids = torch.tensor([
+                    [
+                        min(max(int(dur_list[i]), 0), self.max_duration - 1),
+                        int(bnd_list[i]),
+                        int(tone_list[i]),
+                        int(f0_list[i]),
+                        int(eng_list[i]),
+                    ]
+                    for i in range(prompt_word_count)
+                ], device=device, dtype=torch.long)
+                prompt_word_embs = torch.stack(
+                    word_embs_list[:prompt_word_count], dim=0
+                )
+                style_embs = torch.stack([
+                    prompt_word_embs,
+                    self.duration_embedding.weight[prompt_control_ids[:, 0]],
+                    self.boundary_embedding.weight[prompt_control_ids[:, 1]],
+                    self.tone_embedding.weight[prompt_control_ids[:, 2]],
+                    self.f0_embedding.weight[prompt_control_ids[:, 3]],
+                    self.energy_embedding.weight[prompt_control_ids[:, 4]],
+                ], dim=0).mean(dim=0)
 
             word_idx = 0
             prompt_embs_list = []
@@ -810,18 +815,17 @@ class Qwen2LM(TransformerLM):
             
             # 控制停止符与边界符
             if word_idx < len(word_list):
-                logits[:, forbidden_stop_ids] = -float('inf')
+                logits.index_fill_(1, forbidden_stop_ids, -float('inf'))
             # else:
             #     logits[:, forbidden_bound_ids] = negative_inf
             
             if better_infer is True:
                 if true_dur < final_dur:
                     # 比指定的时长短则强制模型输出有声音的token
-                    logits[:, self.silent_tokens] = -float('inf')
-                    logits[:, forbidden_bound_ids] = -float('inf')
+                    logits.index_fill_(1, silent_and_bound_ids, -float('inf'))
                 elif true_dur == final_dur:
                     # 留一帧缓冲
-                    logits[:, forbidden_bound_ids] = -float('inf')
+                    logits.index_fill_(1, forbidden_bound_ids, -float('inf'))
                 elif true_dur > final_dur:
                     # 最低静音与最大静音设置
                     pause_len = true_dur - final_dur
@@ -901,7 +905,7 @@ class Qwen2LM(TransformerLM):
                 final_f0 = pred_f0 if user_f0 == self.max_f0 else user_f0
                 final_eng = pred_eng if user_eng == self.max_energy else user_eng
 
-                if better_infer == True:
+                if better_infer:
                     if user_bnd == self.max_boundary:
                         final_bnd = min(final_bnd, 3) # 减少长停顿
                     if user_eng == self.max_energy:
