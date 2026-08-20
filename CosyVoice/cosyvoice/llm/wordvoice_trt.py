@@ -139,6 +139,7 @@ class WordVoiceTensorRTDecoder:
             )
 
         self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._stream = torch.cuda.Stream()
         self._execution_lock = threading.Lock()
         self._host_seconds = 0.0
         self._steps = 0
@@ -429,19 +430,25 @@ class WordVoiceTensorRTDecoder:
             present.append((pair[0], pair[1]))
         self._validated_output_shapes = True
 
-        # The caller already serializes each decode step on its current CUDA
-        # stream. Launching on a private stream would add two cross-stream
-        # waits per token without exposing useful overlap.
         current_stream = torch.cuda.current_stream(inputs.device)
+        self._stream.wait_stream(current_stream)
+        inputs.record_stream(self._stream)
+        for tensor in cache_inputs:
+            tensor.record_stream(self._stream)
+        hidden.record_stream(self._stream)
+        for pair in present:
+            for tensor in pair:
+                tensor.record_stream(self._stream)
         event_start = torch.cuda.Event(enable_timing=True)
         event_end = torch.cuda.Event(enable_timing=True)
-        event_start.record(current_stream)
-        if not self.context.execute_async_v3(current_stream.cuda_stream):
+        event_start.record(self._stream)
+        if not self.context.execute_async_v3(self._stream.cuda_stream):
             raise RuntimeError(
                 "WordVoice TensorRT gate failed; stage=execute; "
                 f"engine={self.engine_path}; past_tokens={past_tokens}"
             )
-        event_end.record(current_stream)
+        event_end.record(self._stream)
+        current_stream.wait_stream(self._stream)
         self._events.append((event_start, event_end))
         self._host_seconds += time.perf_counter() - started
         self._steps += 1
