@@ -1,7 +1,9 @@
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 from torch import nn
@@ -189,6 +191,26 @@ class WordVoiceTensorRTBufferTest(unittest.TestCase):
         self.assertEqual(decoder._cache_buffer_allocations, 2)
         self.assertNotEqual(first.data_ptr(), second.data_ptr())
 
+    def test_flat_cache_slot_detection_accepts_state_and_storage_views(self):
+        decoder = object.__new__(WordVoiceTensorRTDecoder)
+        decoder._flat_cache_buffer_slots = [None, None]
+        buffer = torch.arange(1 * 4 * 4 * 2, dtype=torch.float32)
+        decoder._flat_cache_buffer_slots[1] = buffer
+        state = _FlatCacheState(
+            buffer=buffer,
+            slot=1,
+            length=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=2,
+        )
+
+        self.assertEqual(decoder._flat_cache_slot_for_legacy_cache(state), 1)
+        self.assertEqual(
+            decoder._flat_cache_slot_for_legacy_cache(state.to_legacy_cache()),
+            1,
+        )
+
     def test_flat_cache_prefix_view_remains_contiguous(self):
         buffer = torch.empty(2 * 3 * 5 * 7)
 
@@ -221,6 +243,21 @@ class WordVoiceTensorRTBufferTest(unittest.TestCase):
                 num_kv_heads=3,
                 head_dim=7,
             )
+
+    def test_reset_metrics_flushes_queued_timing_before_reuse(self):
+        decoder = object.__new__(WordVoiceTensorRTDecoder)
+        decoder._execution_lock = threading.Lock()
+        decoder._flush_device_timing = Mock()
+        decoder._device_seconds = 4.0
+        decoder._host_seconds = 2.0
+        decoder._steps = 3
+
+        decoder.reset_metrics()
+
+        decoder._flush_device_timing.assert_called_once_with()
+        self.assertEqual(decoder._device_seconds, 0.0)
+        self.assertEqual(decoder._host_seconds, 0.0)
+        self.assertEqual(decoder._steps, 0)
 
 
 if __name__ == "__main__":

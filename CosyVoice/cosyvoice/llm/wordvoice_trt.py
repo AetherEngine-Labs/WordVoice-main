@@ -34,6 +34,12 @@ def cache_tensor_name(kind: str, layer: int, *, present: bool = False) -> str:
     return f"{prefix}_{kind}_{layer}"
 
 
+def _tensor_storage_ptr(tensor: torch.Tensor) -> int:
+    """Return the allocation pointer, including for non-zero-offset views."""
+
+    return tensor.untyped_storage().data_ptr()
+
+
 def _flat_cache_view(
     buffer: torch.Tensor,
     *,
@@ -389,9 +395,9 @@ class WordVoiceTensorRTDecoder:
         first_tensor = legacy_cache[0][0]
         if not isinstance(first_tensor, torch.Tensor):
             return None
-        first_ptr = first_tensor.data_ptr()
+        first_ptr = _tensor_storage_ptr(first_tensor)
         for index, buffers in enumerate(self._cache_buffer_slots):
-            if buffers is not None and buffers.data_ptr() == first_ptr:
+            if buffers is not None and _tensor_storage_ptr(buffers) == first_ptr:
                 return index
         return None
 
@@ -424,6 +430,8 @@ class WordVoiceTensorRTDecoder:
         return self.num_layers * 2 * self.num_kv_heads
 
     def _flat_cache_slot_for_legacy_cache(self, legacy_cache: Any) -> int | None:
+        if isinstance(legacy_cache, _FlatCacheState):
+            return legacy_cache.slot if legacy_cache.slot in (0, 1) else None
         if (
             not legacy_cache
             or not isinstance(legacy_cache[0], (tuple, list))
@@ -433,9 +441,9 @@ class WordVoiceTensorRTDecoder:
         first_tensor = legacy_cache[0][0]
         if not isinstance(first_tensor, torch.Tensor):
             return None
-        first_ptr = first_tensor.data_ptr()
+        first_ptr = _tensor_storage_ptr(first_tensor)
         for index, buffer in enumerate(self._flat_cache_buffer_slots):
-            if buffer is not None and buffer.data_ptr() == first_ptr:
+            if buffer is not None and _tensor_storage_ptr(buffer) == first_ptr:
                 return index
         return None
 
@@ -1175,30 +1183,35 @@ class WordVoiceTensorRTDecoder:
         )
 
     def reset_metrics(self) -> None:
-        self._device_seconds = 0.0
-        self._host_seconds = 0.0
-        self._steps = 0
-        # Callers reset only after generation or an explicit CUDA sync (the
-        # eager-parity gate), so the reusable event pool can start at zero.
-        self._timing_event_cursor = 0
+        with self._execution_lock:
+            # Waiting for the last recorded event makes resetting the cursor
+            # safe even when the caller starts the next request immediately
+            # after enqueueing the previous request.
+            self._flush_device_timing()
+            self._device_seconds = 0.0
+            self._host_seconds = 0.0
+            self._steps = 0
 
     def consume_metrics(self) -> dict[str, Any]:
-        self._flush_device_timing()
-        metrics: dict[str, Any] = {
-            "decoder_backend": "tensorrt",
-            "native_decode_seconds": round(self._device_seconds, 3),
-            "native_host_seconds": round(self._host_seconds, 3),
-            "native_transfer_seconds": 0.0,
-            "native_decode_steps": self._steps,
-            "native_cache_buffer_pool_allocations": self._cache_buffer_allocations,
-            "native_flat_cache_buffer_allocations": self._flat_cache_buffer_allocations,
-            "native_hidden_buffer_pool_allocations": self._hidden_buffer_allocations,
-            "native_input_buffer_allocations": self._input_buffer_allocations,
-            "engine_sha256": self.manifest["engine_sha256"],
-            "manifest_sha256": sha256(self.manifest_path),
-            "tensorrt_version": self.manifest["tensorrt_version"],
-            "cuda_compute_capability": self.manifest["cuda_compute_capability"],
-            "parity": dict(self._parity or {}),
-        }
-        self.reset_metrics()
-        return metrics
+        with self._execution_lock:
+            self._flush_device_timing()
+            metrics: dict[str, Any] = {
+                "decoder_backend": "tensorrt",
+                "native_decode_seconds": round(self._device_seconds, 3),
+                "native_host_seconds": round(self._host_seconds, 3),
+                "native_transfer_seconds": 0.0,
+                "native_decode_steps": self._steps,
+                "native_cache_buffer_pool_allocations": self._cache_buffer_allocations,
+                "native_flat_cache_buffer_allocations": self._flat_cache_buffer_allocations,
+                "native_hidden_buffer_pool_allocations": self._hidden_buffer_allocations,
+                "native_input_buffer_allocations": self._input_buffer_allocations,
+                "engine_sha256": self.manifest["engine_sha256"],
+                "manifest_sha256": sha256(self.manifest_path),
+                "tensorrt_version": self.manifest["tensorrt_version"],
+                "cuda_compute_capability": self.manifest["cuda_compute_capability"],
+                "parity": dict(self._parity or {}),
+            }
+            self._device_seconds = 0.0
+            self._host_seconds = 0.0
+            self._steps = 0
+            return metrics
