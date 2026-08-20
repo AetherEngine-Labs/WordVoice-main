@@ -138,16 +138,6 @@ class WordVoiceTensorRTDecoder:
                 f"expected={sorted(expected_names)}; actual={sorted(actual_names)}"
             )
 
-        self._past_tensor_names = tuple(
-            cache_tensor_name(kind, layer)
-            for layer in range(self.num_layers)
-            for kind in ("key", "value")
-        )
-        self._present_tensor_names = tuple(
-            cache_tensor_name(kind, layer, present=True)
-            for layer in range(self.num_layers)
-            for kind in ("key", "value")
-        )
         self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._stream = torch.cuda.Stream()
         self._execution_lock = threading.Lock()
@@ -381,15 +371,25 @@ class WordVoiceTensorRTDecoder:
             # Cache length changes only when a new token is appended. Repeated
             # lengths (for example across lines) do not need another shape
             # negotiation; tensor addresses are still refreshed every step.
-            for tensor, name in zip(cache_inputs, self._past_tensor_names):
-                if not self.context.set_input_shape(name, tuple(tensor.shape)):
-                    raise RuntimeError(
-                        "WordVoice TensorRT failed to set cache input shape; "
-                        f"tensor={name}; shape={tuple(tensor.shape)}"
-                    )
+            index = 0
+            for layer in range(self.num_layers):
+                for kind in ("key", "value"):
+                    tensor = cache_inputs[index]
+                    name = cache_tensor_name(kind, layer)
+                    if not self.context.set_input_shape(name, tuple(tensor.shape)):
+                        raise RuntimeError(
+                            "WordVoice TensorRT failed to set cache input shape; "
+                            f"tensor={name}; shape={tuple(tensor.shape)}"
+                        )
+                    index += 1
             self._last_cache_shape = cache_shape
-        for tensor, name in zip(cache_inputs, self._past_tensor_names):
-            self.context.set_tensor_address(name, tensor.data_ptr())
+        index = 0
+        for layer in range(self.num_layers):
+            for kind in ("key", "value"):
+                self.context.set_tensor_address(
+                    cache_tensor_name(kind, layer), cache_inputs[index].data_ptr()
+                )
+                index += 1
 
         hidden = torch.empty(
             (1, 1, self.hidden_size), device=inputs.device, dtype=self.dtype
@@ -408,13 +408,13 @@ class WordVoiceTensorRTDecoder:
         present: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in range(self.num_layers):
             pair: list[torch.Tensor] = []
-            for kind_index in (0, 1):
+            for kind in ("key", "value"):
                 tensor = torch.empty(
                     (1, self.num_kv_heads, past_tokens + 1, self.head_dim),
                     device=inputs.device,
                     dtype=self.dtype,
                 )
-                name = self._present_tensor_names[2 * layer + kind_index]
+                name = cache_tensor_name(kind, layer, present=True)
                 if not self._validated_output_shapes:
                     actual_shape = tuple(self.context.get_tensor_shape(name))
                     if actual_shape != tuple(tensor.shape):
