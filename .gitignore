@@ -1,0 +1,4 @@
+# Local Python bytecode and incomplete model-download artifacts.
+__pycache__/
+*.py[cod]
+/checkpoints/**/*.partial
