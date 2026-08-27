@@ -22,6 +22,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import Qwen2ForCausalLM
+from transformers.cache_utils import Cache, DynamicCache
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
@@ -61,6 +62,13 @@ def _hash_tensor(digest, name: str, tensor: torch.Tensor) -> None:
 def _cache_tuple(cache) -> tuple:
     legacy = cache.to_legacy_cache() if hasattr(cache, 'to_legacy_cache') else cache
     return tuple((key, value) for key, value in legacy)
+
+
+def _model_cache(cache):
+    """Adapt stored legacy KV tuples to the Transformers cache contract."""
+    if cache is None or isinstance(cache, Cache):
+        return cache
+    return DynamicCache.from_legacy_cache(cache)
 
 
 def _tensor_bytes(value) -> int:
@@ -286,7 +294,7 @@ class Qwen2Encoder(torch.nn.Module):
             output_hidden_states=True,
             return_dict=True,
             use_cache=True,
-            past_key_values=cache,
+            past_key_values=_model_cache(cache),
         )
         xs = outs.hidden_states[-1]
         new_cache = outs.past_key_values
